@@ -258,8 +258,10 @@ Common device fields are:
 ### Chords
 
 Press two buttons together to run any action instead of either button's own.
-There is no GUI for chords yet, so they are set here, per device. They parse on
-every platform, but only Linux acts on them.
+On Linux, set them in the **Chords** section of a button's inspector, for the
+default profile or one application, or set them here. The window is in
+Settings. They parse on every platform, but only Linux shows them or acts on
+them.
 
 ```toml
 [devices."<physical-key>".chords]

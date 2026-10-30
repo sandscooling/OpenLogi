@@ -34,7 +34,7 @@ pub(super) use gpui_component::{
 pub(super) use gpui_updater::{UpdateStatus, Updater};
 pub(super) use openlogi_core::brand::{HELP_URL, RELEASES_URL, REPO_URL};
 pub(super) use openlogi_core::config::{
-    Appearance, AssetSourcePreference, ClickLockHold, ThumbwheelSensitivity, UiScale,
+    Appearance, AssetSourcePreference, ChordWindow, ClickLockHold, ThumbwheelSensitivity, UiScale,
     VerticalScrollSensitivity,
 };
 
@@ -126,6 +126,7 @@ pub struct SettingsView {
     thumbwheel_sensitivity: CommitSlider<ThumbwheelSensitivity>,
     vertical_scroll_sensitivity: CommitSlider<VerticalScrollSensitivity>,
     click_lock_hold: CommitSlider<ClickLockHold>,
+    chord_window: CommitSlider<ChordWindow>,
     /// Shared app-wide updater, surfaced on the Updates page. A launch-time
     /// check result is already visible when the window opens.
     updater: Entity<Updater>,
@@ -222,6 +223,7 @@ impl SettingsView {
         let thumbwheel_sensitivity = Self::thumbwheel_sensitivity_slider(cx);
         let vertical_scroll_sensitivity = Self::vertical_scroll_sensitivity_slider(cx);
         let click_lock_hold = Self::click_lock_hold_slider(cx);
+        let chord_window = Self::chord_window_slider(cx);
 
         // Poll the agent's live event monitor while this window is open. The task
         // is held in the view, so closing Settings drops it, polling stops, and
@@ -266,6 +268,7 @@ impl SettingsView {
             thumbwheel_sensitivity,
             vertical_scroll_sensitivity,
             click_lock_hold,
+            chord_window,
             updater,
             updater_obs,
             copied: false,
@@ -347,6 +350,33 @@ impl SettingsView {
                 AppState::apply(cx, |state| state.commit_click_lock_hold(hold));
             },
         )
+    }
+
+    /// The chord window slider, committed once it is released.
+    fn chord_window_slider(cx: &mut Context<Self>) -> CommitSlider<ChordWindow> {
+        let current = AppState::try_read(cx).map_or(ChordWindow::DEFAULT, |state| {
+            state.app_settings().chords.window_ms
+        });
+        CommitSlider::new(
+            SliderRange::new(ChordWindow::MIN, ChordWindow::MAX)
+                .step(f32::from(ChordWindow::STEP_MS)),
+            current,
+            cx,
+            |_, window, cx| {
+                AppState::apply(cx, |state| state.commit_chord_window(window));
+            },
+        )
+    }
+
+    /// What the chord window row shows for this frame.
+    fn chord_window_row(&self, cx: &App) -> general::ChordWindowRow {
+        let committed = AppState::try_read(cx).map_or(ChordWindow::DEFAULT, |state| {
+            state.app_settings().chords.window_ms
+        });
+        general::ChordWindowRow {
+            window: self.chord_window.shown(committed),
+            slider: self.chord_window.slider().clone(),
+        }
     }
 
     fn on_language_select(
@@ -440,15 +470,17 @@ impl Render for SettingsView {
         // these independently owned sliders so neither can keep presenting the
         // rejected value after that rollback.
         if let Some(settings) = AppState::try_read(cx).map(AppState::app_settings) {
-            let (vertical_scroll, thumbwheel, hold) = (
+            let (vertical_scroll, thumbwheel, hold, chord_window) = (
                 settings.vertical_scroll_sensitivity,
                 settings.thumbwheel_sensitivity,
                 settings.click_lock.hold_ms,
+                settings.chords.window_ms,
             );
             self.vertical_scroll_sensitivity
                 .sync(vertical_scroll, window, cx);
             self.thumbwheel_sensitivity.sync(thumbwheel, window, cx);
             self.click_lock_hold.sync(hold, window, cx);
+            self.chord_window.sync(chord_window, window, cx);
         }
         let click_lock = AppState::try_read(cx).map_or(
             general::ClickLockRows {
@@ -466,6 +498,7 @@ impl Render for SettingsView {
                 hold_slider: self.click_lock_hold.slider().clone(),
             },
         );
+        let chord_window = self.chord_window_row(cx);
         let pal = theme::palette(cx);
         let view = cx.entity();
         // Only surface the Camera permission when a webcam is actually present,
@@ -491,6 +524,7 @@ impl Render for SettingsView {
                     thumbwheel: self.thumbwheel_sensitivity.slider().clone(),
                 },
                 click_lock,
+                chord_window,
                 self.registration_status,
             ))
             .page(updates::updates_page(self.updater.clone()));

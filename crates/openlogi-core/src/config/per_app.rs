@@ -1,13 +1,13 @@
-//! Per-application profiles: the button overrides a device stores for one
-//! application, and how the application in front is matched to them.
+//! Per-application profiles: the button and chord overrides a device stores
+//! for one application, and how the application in front is matched to them.
 //!
-//! An override replaces a whole button with a single action. Editing addresses
-//! a profile by its exact key; matching goes through [`overlay_for`], which
+//! An override replaces a whole button or chord with a single action. Editing
+//! addresses a profile by its exact key; matching goes through [`overlay_for`], which
 //! also falls back from a Windows executable path to that executable's
 //! `exe:<filename>` key, and then to the `app:<alias>` key of the
 //! [`Config::apps`] alias that lists the application.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::{Config, chords_supported};
 use crate::app::{overlay_for, profile_key_for};
@@ -94,13 +94,60 @@ impl Config {
         }
     }
 
+    /// Records a chord in `device_key`'s default profile, or with `None`
+    /// removes it. Removing one also drops the per-app entries that only turned
+    /// it off: they have nothing left to turn off, and would keep an application
+    /// listed as a profile with nothing in it.
+    pub fn set_chord(&mut self, device_key: &str, chord: ChordId, action: Option<Action>) {
+        let device = self.devices.entry(device_key.to_string()).or_default();
+        if let Some(action) = action {
+            device.chords.insert(chord, action);
+            return;
+        }
+        device.chords.remove(&chord);
+        for overlay in device.per_app_chords.values_mut() {
+            overlay.retain(|id, action| *id != chord || *action != Action::None);
+        }
+        device
+            .per_app_chords
+            .retain(|_, overlay| !overlay.is_empty());
+    }
+
+    /// Records a per-app chord entry. [`Action::None`] turns the chord off for
+    /// that application; passing `None` removes the entry, so the application
+    /// inherits the device's chord again, and prunes the empty app map.
+    pub fn set_per_app_chord(
+        &mut self,
+        device_key: &str,
+        bundle_id: &str,
+        chord: ChordId,
+        action: Option<Action>,
+    ) {
+        let device = self.devices.entry(device_key.to_string()).or_default();
+        let overlay = device
+            .per_app_chords
+            .entry(bundle_id.to_string())
+            .or_default();
+        match action {
+            Some(action) => {
+                overlay.insert(chord, action);
+            }
+            None => {
+                overlay.remove(&chord);
+            }
+        }
+        device
+            .per_app_chords
+            .retain(|_, overlay| !overlay.is_empty());
+    }
+
     /// The overrides `device_key` stores for the application key `app`,
     /// or `None` when it has no profile for it.
     ///
     /// Exact key, deliberately: this answers "what did the user author under
     /// this key", which is what an editor needs to show and to clear. The
-    /// question [`Self::has_app_override`] answers — "will the app in front hit
-    /// a profile" — is the matcher's, and goes through the same `exe:` and
+    /// question [`Self::has_app_override`] answers ("will the app in front hit
+    /// a profile") is the matcher's, and goes through the same `exe:` and
     /// alias fallbacks the matcher does. The two look interchangeable and are
     /// not.
     #[must_use]
@@ -116,32 +163,62 @@ impl Config {
             .filter(|overrides| !overrides.is_empty())
     }
 
-    /// Every application key `device_key` has a profile for, in key order.
-    pub fn app_profiles(&self, device_key: &str) -> impl Iterator<Item = &str> {
+    /// The chord entries `device_key` stores for the application key `app`, on
+    /// a platform that runs chords, or `None` when it has none. Exact key, like
+    /// [`Self::per_app_overrides`].
+    #[must_use]
+    pub fn per_app_chord_overrides(
+        &self,
+        device_key: &str,
+        app: &str,
+    ) -> Option<&BTreeMap<ChordId, Action>> {
         self.devices
             .get(device_key)
-            .into_iter()
-            .flat_map(|device| device.per_app_bindings.keys().map(String::as_str))
+            .filter(|_| chords_supported())?
+            .per_app_chords
+            .get(app)
+            .filter(|overrides| !overrides.is_empty())
     }
 
-    /// Drop `device_key`'s whole profile for `app`. Nothing happens when there
-    /// is none.
-    pub fn remove_app_profile(&mut self, device_key: &str, app: &str) {
-        if let Some(device) = self.devices.get_mut(device_key) {
-            device.per_app_bindings.remove(app);
-        }
+    /// Every application key `device_key` has a profile for, in key order: a
+    /// profile of button overrides, of chord entries, or of both. Chord entries
+    /// count only on a platform that runs them, so elsewhere they make no
+    /// profile the user could not see the contents of.
+    pub fn app_profiles(&self, device_key: &str) -> impl Iterator<Item = &str> {
+        self.devices.get(device_key).into_iter().flat_map(|device| {
+            let chords = device.per_app_chords.keys().filter(|_| chords_supported());
+            device
+                .per_app_bindings
+                .keys()
+                .chain(chords)
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        })
     }
 
-    /// Whether `device_key` has a non-empty per-app binding overlay for the
-    /// foreground app `app`. Drives the menu-bar popover's "override
-    /// active" badge — when the current app has its own bindings for this
-    /// device, the global bindings are (partly) overridden.
+    /// Drop `device_key`'s whole profile for `app`, reporting whether there was
+    /// one. Chord entries go with it on a platform that runs them, and stay
+    /// untouched elsewhere, where they are not shown.
+    pub fn remove_app_profile(&mut self, device_key: &str, app: &str) -> bool {
+        let Some(device) = self.devices.get_mut(device_key) else {
+            return false;
+        };
+        let buttons = device.per_app_bindings.remove(app).is_some();
+        let chords = chords_supported() && device.per_app_chords.remove(app).is_some();
+        buttons || chords
+    }
+
+    /// Whether `device_key` has a non-empty per-app overlay of bindings or, on
+    /// a platform that runs them, chords for the foreground app `app`. Drives
+    /// the active-profile badge: when the current app has its own overlay for
+    /// this device, the global profile is (partly) overridden.
     #[must_use]
     pub fn has_app_override(&self, device_key: &str, app: &str) -> bool {
-        self.devices.get(device_key).is_some_and(|d| {
-            overlay_for(&d.per_app_bindings, &self.apps, app)
-                .is_some_and(|overlay| !overlay.is_empty())
-        })
+        self.has_app_chords(device_key, app)
+            || self.devices.get(device_key).is_some_and(|d| {
+                overlay_for(&d.per_app_bindings, &self.apps, app)
+                    .is_some_and(|overlay| !overlay.is_empty())
+            })
     }
 
     /// Whether `device_key` has a chord overlay for the foreground app `app`,

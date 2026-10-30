@@ -185,7 +185,8 @@ pub fn chord_members_for(config: &Config, config_key: &str) -> BTreeSet<ButtonId
 /// Whether both of a chord's members can reach the runtime. With the OS hook
 /// opted out, Middle, Back and Forward stay native and report no press, so a
 /// chord naming one could never complete.
-fn chord_is_deliverable(config: &Config, id: ChordId) -> bool {
+#[must_use]
+pub fn chord_is_deliverable(config: &Config, id: ChordId) -> bool {
     config.app_settings.capture_mouse_events
         || !id.members().iter().any(|button| button.is_os_hook_button())
 }

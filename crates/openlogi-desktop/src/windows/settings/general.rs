@@ -1,16 +1,16 @@
 //! General settings page.
 
 use super::{
-    App, AppState, ClickLockHold, Disableable, Entity, FluentBuilder, IconName, InteractiveElement,
-    ParentElement, SettingField, SettingGroup, SettingItem, SettingPage, Sizable, Slider,
-    SliderState, Styled, ThumbwheelSensitivity, VerticalScrollSensitivity, div, h_flex, px, theme,
-    v_flex,
+    App, AppState, ChordWindow, ClickLockHold, Disableable, Entity, FluentBuilder, IconName,
+    InteractiveElement, ParentElement, SettingField, SettingGroup, SettingItem, SettingPage,
+    Sizable, Slider, SliderState, Styled, ThumbwheelSensitivity, VerticalScrollSensitivity, div,
+    h_flex, px, theme, v_flex,
 };
 use crate::ui::theme::Typography as _;
 use gpui_base::Button as BaseButton;
 use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::switch::Switch;
-use openlogi_core::config::{MouseProfileTarget, click_lock_supported};
+use openlogi_core::config::{MouseProfileTarget, chords_supported, click_lock_supported};
 
 use crate::platform::registration::ServiceStatus;
 
@@ -32,9 +32,17 @@ pub(super) struct ClickLockRows {
     pub(super) hold_slider: Entity<SliderState>,
 }
 
+/// What the chord window row shows, resolved by the view that owns the slider.
+pub(super) struct ChordWindowRow {
+    /// The window to show: the one under a dragged thumb, else the committed one.
+    pub(super) window: ChordWindow,
+    pub(super) slider: Entity<SliderState>,
+}
+
 pub(super) fn general_page(
     sliders: SensitivitySliders,
     click_lock: ClickLockRows,
+    chord_window: ChordWindowRow,
     registration_status: ServiceStatus,
 ) -> SettingPage {
     let SensitivitySliders {
@@ -43,6 +51,11 @@ pub(super) fn general_page(
     } = sliders;
     let group = SettingGroup::new().item(mouse_profile_target_item());
     let group = click_lock_items(group, click_lock);
+    let group = if chords_supported() {
+        group.item(chord_window_item(chord_window))
+    } else {
+        group
+    };
     let group = group
         .item(smooth_scrolling_item())
         .item(
@@ -215,6 +228,27 @@ fn click_lock_hold_item(
     )
     .disabled(!can_run)
     .description(tr!("pointer.click_lock_hold_description"))
+}
+
+/// The chord window slider. Chords run over HID++ as well as the input hook,
+/// so unlike click lock this stays live without a hook.
+fn chord_window_item(row: ChordWindowRow) -> SettingItem {
+    let ChordWindowRow { window, slider } = row;
+    SettingItem::new(
+        tr!("pointer.chord_window"),
+        SettingField::render(move |_, _, cx| {
+            let ms = u16::from(window).to_string();
+            let value = tr!("pointer.chord_window_value", ms => ms);
+            slider_field(
+                Slider::new(&slider),
+                value.to_string(),
+                window == ChordWindow::DEFAULT,
+                cx,
+            )
+            .debug_selector(|| "chord-window".into())
+        }),
+    )
+    .description(tr!("pointer.chord_window_description"))
 }
 
 /// The smooth-scrolling switch.
@@ -542,6 +576,59 @@ mod tests {
         set_hook_installed(&mut visual, true);
         click_at(&mut visual, "click-lock-switch");
         assert!(!click_lock(&mut visual).enabled);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn chord_window(visual: &mut VisualTestContext) -> ChordWindow {
+        visual.update(|_, cx| {
+            AppState::try_read(cx)
+                .unwrap()
+                .app_settings()
+                .chords
+                .window_ms
+        })
+    }
+
+    /// A click on the bar commits one window, on a step, inside the range, and
+    /// the value column shows it in milliseconds. Greek stays inside the window.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn the_chord_window_slider_commits_a_step_on_release(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("el");
+        let mut visual = settings_window(cx, Config::ephemeral(), false);
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(920.), px(640.)));
+        let row = visual.debug_bounds("chord-window").unwrap();
+        assert!(viewport.contains(&row.origin) && viewport.contains(&row.bottom_right()));
+        assert_eq!(chord_window(&mut visual), ChordWindow::DEFAULT);
+
+        click_at(&mut visual, "chord-window");
+        let window = chord_window(&mut visual);
+        assert_ne!(window, ChordWindow::DEFAULT);
+        assert!(window > ChordWindow::MIN && window < ChordWindow::MAX);
+        assert_eq!(u16::from(window) % ChordWindow::STEP_MS, 0, "{window:?}");
+        rust_i18n::set_locale("en");
+    }
+
+    /// A refused write leaves the stored window, and the thumb follows it back.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn a_failed_save_keeps_the_chord_window(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut visual = settings_window(cx, Config::ephemeral(), true);
+        click_at(&mut visual, "chord-window");
+        assert_eq!(chord_window(&mut visual), ChordWindow::DEFAULT);
+    }
+
+    /// Everywhere else the field only parses, so no row claims otherwise.
+    #[cfg(not(target_os = "linux"))]
+    #[gpui::test]
+    fn no_other_platform_shows_the_chord_window(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut visual = settings_window(cx, Config::ephemeral(), false);
+        assert!(visual.debug_bounds("chord-window").is_none());
     }
 
     /// Everywhere else the field only parses, so no row claims otherwise.

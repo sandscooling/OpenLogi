@@ -50,6 +50,18 @@ impl ChordId {
     pub const fn members(self) -> [ButtonId; 2] {
         [self.first, self.second]
     }
+
+    /// The other member, when `button` is one of the two.
+    #[must_use]
+    pub fn partner_of(self, button: ButtonId) -> Option<ButtonId> {
+        if button == self.first {
+            Some(self.second)
+        } else if button == self.second {
+            Some(self.first)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for ChordId {
@@ -121,6 +133,14 @@ mod tests {
             [ButtonId::Back, ButtonId::Forward],
             "members are canonical"
         );
+    }
+
+    #[test]
+    fn a_member_finds_its_partner_and_a_stranger_finds_none() {
+        let chord = ChordId::new(ButtonId::Forward, ButtonId::Back).expect("eligible pair");
+        assert_eq!(chord.partner_of(ButtonId::Back), Some(ButtonId::Forward));
+        assert_eq!(chord.partner_of(ButtonId::Forward), Some(ButtonId::Back));
+        assert_eq!(chord.partner_of(ButtonId::MiddleClick), None);
     }
 
     #[test]

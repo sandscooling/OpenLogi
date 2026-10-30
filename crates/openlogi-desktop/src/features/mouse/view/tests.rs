@@ -7,6 +7,9 @@ use crate::services::assets::AssetResolver;
 use crate::services::i18n::LOCALE_LOCK;
 use crate::state::Sources;
 
+#[cfg(target_os = "linux")]
+mod chords;
+
 fn install_app_state(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let resolver = AssetResolver::new();
@@ -94,7 +97,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
 
     click_picker_control(cx, "label-card-Button(Forward)");
     click_picker_control(cx, "inspector-current-action");
-    view.read_with(cx, |view, _| assert!(view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(view.action_picker_open()));
     assert!(cx.debug_bounds("inspector-action-Copy").is_some());
 
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
@@ -109,7 +112,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
 
     click_picker_control(cx, "inspector-action-custom-application-add");
     view.read_with(cx, |view, _| {
-        assert!(view.action_picker_open);
+        assert!(view.action_picker_open());
         assert!(view.invalid_drafts.shortcut);
         assert!(view.invalid_drafts.application);
     });
@@ -135,7 +138,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
             .is_some()
     );
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.action_picker_open()));
     assert_forward_binding(cx, &Action::CustomShortcut("Cmd+K".parse().unwrap()));
 
     click_picker_control(cx, "inspector-current-action");
@@ -151,7 +154,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     click_picker_control(cx, "inspector-action-custom-application-input");
     cx.simulate_input("/Applications/Calculator.app");
     click_picker_control(cx, "inspector-action-custom-application-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.action_picker_open()));
     cx.update(|_, cx| {
         let Action::OpenApplication(target) =
             &AppState::try_read(cx).unwrap().button_bindings()[&ButtonId::Forward]
@@ -169,7 +172,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     click_picker_control(cx, "inspector-action-custom-shortcut-input");
     cx.simulate_input("Cmd+K");
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.action_picker_open()));
     assert_forward_binding(cx, &Action::HoldShortcut("Cmd+K".parse().unwrap()));
 
     click_picker_control(cx, "inspector-current-action");
@@ -185,7 +188,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     cx.simulate_input("Copy");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     click_picker_control(cx, "inspector-action-Copy");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.action_picker_open()));
     assert_forward_binding(cx, &Action::Copy);
 
     drop(view);
@@ -231,7 +234,10 @@ fn record_fills_the_custom_shortcut_from_the_next_key_press(cx: &mut TestAppCont
             .is_none()
     );
     view.read_with(cx, |view, _| {
-        assert!(view.action_picker_open, "recording alone commits nothing");
+        assert!(
+            view.picker == InspectorPicker::Action,
+            "recording alone commits nothing"
+        );
     });
     assert_forward_binding(cx, &default_binding(ButtonId::Forward));
 
@@ -267,7 +273,7 @@ fn record_fills_the_custom_shortcut_from_the_next_key_press(cx: &mut TestAppCont
     assert_eq!(shortcut_text(cx), "Ctrl+Shift+PageUp");
 
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.action_picker_open()));
     assert_forward_binding(
         cx,
         &Action::CustomShortcut("Ctrl+Shift+PageUp".parse().unwrap()),
@@ -295,7 +301,7 @@ fn the_action_picker_binds_a_button_to_a_shell_command(cx: &mut TestAppContext) 
 
     click_picker_control(cx, "inspector-action-custom-command-add");
     view.read_with(cx, |view, _| {
-        assert!(view.action_picker_open);
+        assert!(view.action_picker_open());
         assert_eq!(
             view.invalid_drafts,
             InvalidDrafts {
@@ -319,7 +325,7 @@ fn the_action_picker_binds_a_button_to_a_shell_command(cx: &mut TestAppContext) 
             .is_none()
     );
     click_picker_control(cx, "inspector-action-custom-command-add");
-    view.read_with(cx, |view, _| assert!(!view.action_picker_open));
+    view.read_with(cx, |view, _| assert!(!view.action_picker_open()));
     assert_forward_binding(cx, &Action::RunShellCommand("snipaste snip".into()));
 
     click_picker_control(cx, "inspector-current-action");
@@ -362,10 +368,12 @@ fn a_selected_gesture_can_render_in_the_binding_inspector(cx: &mut TestAppContex
                 wheel_hold: &BTreeSet::new(),
                 editing_app: None,
                 overridden: None,
+                chords: None,
+                chord_overrides: 0,
                 press_force: None,
             },
             ActionPickerContext {
-                open: true,
+                target: InspectorPicker::Action,
                 search: &view.action_search,
                 shortcut_input: &view.custom_shortcut_input,
                 application_input: &view.custom_application_input,
@@ -394,11 +402,11 @@ fn selecting_another_control_closes_the_action_picker(cx: &mut TestAppContext) {
 
     view.update(cx, |view, _| {
         view.selected = Some(MouseControlId::Button(ButtonId::Back));
-        view.action_picker_open = true;
+        view.picker = InspectorPicker::Action;
 
         view.select(MouseControlId::Button(ButtonId::Forward));
 
-        assert!(!view.action_picker_open);
+        assert!(!view.action_picker_open());
     });
     drop(view);
     cx.update(|window, _| window.remove_window());
@@ -636,6 +644,26 @@ fn an_app_profile_explains_that_an_action_replaces_wheel_hold(cx: &mut TestAppCo
         cx.debug_bounds("inspector-wheel-hold-app-note").is_none(),
         "once the app overrides the button, its own action already applies"
     );
+    drop(view);
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+/// Everywhere else chords only parse, so nothing offers them.
+#[cfg(not(target_os = "linux"))]
+#[gpui::test]
+fn no_other_platform_shows_chords(cx: &mut TestAppContext) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let mut config = Config::ephemeral();
+    config.set_chord(
+        crate::state::tests::KNOWN_MOUSE_KEY,
+        "Back+Forward".parse().unwrap(),
+        Some(Action::Copy),
+    );
+    let (view, cx) = wheel_hold_view(cx, false, config, ButtonId::Back);
+    assert!(cx.debug_bounds("inspector-current-action").is_some());
+    assert!(cx.debug_bounds("inspector-chords").is_none());
     drop(view);
     cx.update(|window, _| window.remove_window());
     cx.run_until_parked();

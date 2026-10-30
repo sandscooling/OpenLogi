@@ -1469,3 +1469,80 @@ fn a_key_binding_edit_repaints_the_secure_input_notice(cx: &mut gpui::TestAppCon
     );
     assert!(!secure_input_notice_drawn(cx));
 }
+
+/// A profile summary too long for one line wraps beside the inspector: it must
+/// not widen the workspace and push the inspector, with its chord buttons, out
+/// of the window.
+#[gpui::test]
+fn a_long_profile_summary_keeps_the_inspector_inside_the_window(cx: &mut gpui::TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gpui::{AppContext as _, px, size};
+    use gpui_component::Root;
+
+    use super::AppView;
+    use crate::services::assets::AssetResolver;
+    use crate::state::tests::direct_inventory;
+    use crate::state::{AgentLink, AppState, Sources};
+
+    let _locale = crate::services::i18n::LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("de");
+    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        let resolver = AssetResolver::new();
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let state = cx.new(|_| {
+            let mut state = AppState::new(Sources {
+                inventories: &[direct_inventory([0xa3, 0x93, 0xca, 0xe0])],
+                ..Sources::in_memory(
+                    openlogi_core::config::Config::ephemeral(),
+                    &resolver,
+                    commands,
+                )
+            });
+            let _ = state.set_agent_link(AgentLink::Ready(status_with(
+                openlogi_ipc::SecureInput::Off,
+            )));
+            state
+        });
+        AppState::set_global(state, cx);
+    });
+    let hosted = Rc::new(RefCell::new(None));
+    let slot = Rc::clone(&hosted);
+    let (_, cx) = cx.add_window_view(move |window, cx| {
+        let view = cx.new(|cx| AppView::new(window, cx));
+        *slot.borrow_mut() = Some(view.clone());
+        Root::new(view, window, cx)
+    });
+    let app_view = hosted
+        .borrow_mut()
+        .take()
+        .expect("the window hosts the app view");
+    let width = px(1024.);
+    cx.simulate_resize(size(width, px(900.)));
+    cx.update(|window, cx| {
+        let record_key = AppState::try_read(cx)
+            .expect("state is installed")
+            .devices()[0]
+            .record_key()
+            .clone();
+        app_view.update(cx, |view, cx| {
+            view.open_device(record_key, cx);
+            view.active_tab = DetailTab::Buttons;
+            cx.notify();
+        });
+        AppState::apply(cx, |state| {
+            state.set_editing_app(Some("com.example.Application".into()))
+        });
+        window.draw(cx).clear(cx);
+    });
+    let inspector = cx
+        .debug_bounds("button-inspector")
+        .expect("the Buttons workspace shows its inspector");
+    assert!(
+        inspector.right() <= width,
+        "{inspector:?} leaves a {width:?} wide window"
+    );
+    rust_i18n::set_locale("en");
+}

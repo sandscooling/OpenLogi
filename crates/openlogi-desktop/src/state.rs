@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 use tracing::warn;
 
 pub use backlight::DurationSteps;
+pub use bindings::{ChordEntry, ChordStanding};
 pub use config::ConfigPersistence;
 pub(crate) use device_key::DeviceKey;
 pub(crate) use device_session::ObservedConnection;
@@ -510,11 +511,15 @@ impl AppState {
             .into_iter()
             .flat_map(move |key| {
                 self.config.app_profiles(key).map(move |app| {
-                    let count = self
+                    let buttons = self
                         .config
                         .per_app_overrides(key, app)
                         .map_or(0, BTreeMap::len);
-                    (app, count)
+                    let chords = self
+                        .config
+                        .per_app_chord_overrides(key, app)
+                        .map_or(0, BTreeMap::len);
+                    (app, buttons + chords)
                 })
             })
     }

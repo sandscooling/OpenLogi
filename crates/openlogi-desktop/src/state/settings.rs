@@ -6,8 +6,8 @@ use super::{AppState, StateEvent};
 use crate::platform::app_icon::AppIconExt as _;
 use gpui_component::ThemeMode;
 use openlogi_core::config::{
-    AppIcon, AppSettings, Appearance, AssetSourcePreference, ClickLockHold, DeviceViewMode,
-    MouseProfileTarget, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
+    AppIcon, AppSettings, Appearance, AssetSourcePreference, ChordWindow, ClickLockHold,
+    DeviceViewMode, MouseProfileTarget, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
 };
 use openlogi_core::update_feed::UpdateChannel;
 
@@ -347,6 +347,18 @@ impl AppState {
         self.config
             .edit(|config| config.app_settings.click_lock.hold_ms = hold);
         self.persist_and_reload("click lock hold time");
+        StateEvent::SettingsChanged.into()
+    }
+    /// Set the chord window and persist it. The agent publishes the value on
+    /// config reload, for the next press. An already-set value writes nothing
+    /// and is still reported; disk failures restore the persisted value.
+    pub fn commit_chord_window(&mut self, window: ChordWindow) -> StateEvents {
+        if self.config.app_settings.chords.window_ms == window {
+            return StateEvent::SettingsChanged.into();
+        }
+        self.config
+            .edit(|config| config.app_settings.chords.window_ms = window);
+        self.persist_and_reload("chord window");
         StateEvent::SettingsChanged.into()
     }
     /// Toggle the overlay's low-battery notices and persist it. The agent

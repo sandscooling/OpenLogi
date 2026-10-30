@@ -240,6 +240,113 @@ fn a_reset_ring_profile_shows_the_default_its_next_edit_starts_from() {
     assert_eq!(state.current_action_ring().per_app[editor], expected);
 }
 
+/// A chord-only profile, written to a real file, in the state that edits it.
+#[cfg(target_os = "linux")]
+fn state_with_a_chord_only_profile(
+    dir: &std::path::Path,
+) -> (
+    AppState,
+    tokio::sync::mpsc::UnboundedReceiver<crate::services::ipc::Command>,
+    std::path::PathBuf,
+    AssetResolver,
+) {
+    use openlogi_core::config::ConfigFile;
+
+    let path = dir.join(openlogi_core::paths::CONFIG_FILE);
+    let (mut config, mut file) = ConfigFile::load_from_path(&path).unwrap();
+    config.set_per_app_chord(
+        KNOWN_MOUSE_KEY,
+        "Safari",
+        "Back+Forward".parse().unwrap(),
+        Some(Action::Copy),
+    );
+    file.save(&config).unwrap();
+    let resolver = AssetResolver::new();
+    let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let state = AppState::new(Sources {
+        inventories: &[direct_inventory([0xa3, 0x93, 0xca, 0xe0])],
+        persistence: ConfigPersistence::UserFile(file),
+        ..Sources::in_memory(config, &resolver, commands)
+    });
+    (state, receiver, path, resolver)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn every_way_of_removing_a_profile_takes_its_chords_and_reloads_once() {
+    let commands: [fn(&mut AppState, &DeviceKey, &str) -> crate::state::StateEvents; 3] = [
+        AppState::remove_app_profile,
+        AppState::reset_app_profile,
+        AppState::remove_all_app_profiles,
+    ];
+    for (command, keeps_editor) in commands.into_iter().zip([false, true, false]) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut state, mut receiver, path, _resolver) =
+            state_with_a_chord_only_profile(dir.path());
+        receiver.try_recv().unwrap();
+        let _ = state.set_editing_app(Some("Safari".into()));
+        assert_eq!(state.app_profiles().collect::<Vec<_>>(), [("Safari", 1)]);
+        assert_eq!(state.editing_app_chord_count(), 1);
+
+        let _ = command(&mut state, &DeviceKey::from(KNOWN_MOUSE_KEY), "Safari");
+
+        assert_eq!(state.editing_app(), keeps_editor.then_some("Safari"));
+        assert!(state.app_profiles().next().is_none());
+        assert_eq!(state.editing_app_chord_count(), 0);
+        let saved = Config::load_from_path(&path).unwrap();
+        assert!(saved.devices[KNOWN_MOUSE_KEY].per_app_chords.is_empty());
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(crate::services::ipc::Command::ReloadConfig(_))
+        ));
+        assert!(receiver.try_recv().is_err(), "one save, one reload");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_failed_removal_keeps_a_chord_only_profile_and_its_editor() {
+    let mut config = Config::ephemeral();
+    config.set_per_app_chord(
+        KNOWN_MOUSE_KEY,
+        "Safari",
+        "Back+Forward".parse().unwrap(),
+        Some(Action::Copy),
+    );
+    let resolver = AssetResolver::new();
+    let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut state = AppState::new(Sources {
+        inventories: &[direct_inventory([0xa3, 0x93, 0xca, 0xe0])],
+        persistence: ConfigPersistence::ReadOnly("read-only".into()),
+        ..Sources::in_memory(config, &resolver, commands)
+    });
+    let _ = state.set_editing_app(Some("Safari".into()));
+    let _ = state.remove_all_app_profiles(&DeviceKey::from(KNOWN_MOUSE_KEY), "Safari");
+    assert_eq!(state.editing_app(), Some("Safari"));
+    assert_eq!(state.app_profiles().collect::<Vec<_>>(), [("Safari", 1)]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_chord_override_makes_the_app_in_front_the_active_profile() {
+    let mut state = state_with_a_known_mouse();
+    let safari = app("com.apple.Safari", "Safari");
+    let _ = state.set_foreground(ForegroundApps {
+        current: Some(safari.clone()),
+        recent: vec![safari],
+    });
+    assert_eq!(state.active_profile_name(), None);
+    state.config.edit(|config| {
+        config.set_per_app_chord(
+            KNOWN_MOUSE_KEY,
+            "com.apple.Safari",
+            "Back+Forward".parse().unwrap(),
+            Some(Action::None),
+        );
+    });
+    assert_eq!(state.active_profile_name(), Some("Safari"));
+}
+
 #[test]
 fn removing_all_app_profiles_only_closes_editors_showing_that_app() {
     for (buttons_app, ring_app) in [("Safari", "Chrome"), ("Chrome", "Safari")] {

@@ -581,3 +581,106 @@ fn gesture_maps_cover_every_gesture_mode_button() {
         "a promoted OS-hook button gets its own menu simultaneously"
     );
 }
+
+#[cfg(target_os = "linux")]
+mod chords {
+    use openlogi_core::binding::ChordId;
+    use openlogi_core::bindings::chords_for;
+
+    use super::*;
+    use crate::state::ChordStanding;
+
+    const SAFARI: &str = "com.apple.Safari";
+
+    fn id() -> ChordId {
+        "Back+Forward".parse().unwrap()
+    }
+
+    fn standing(state: &AppState) -> Vec<(Action, ChordStanding)> {
+        state
+            .chord_entries()
+            .unwrap()
+            .into_iter()
+            .map(|entry| (entry.action, entry.standing))
+            .collect()
+    }
+
+    #[test]
+    fn nothing_in_the_default_profile_means_no_chord() {
+        let mut state = state_with_a_known_mouse();
+        let _ = state.commit_chord(id(), Action::Copy);
+        assert_eq!(standing(&state), [(Action::Copy, ChordStanding::Default)]);
+        let _ = state.commit_chord(id(), Action::None);
+        assert!(standing(&state).is_empty());
+        assert!(state.config.devices[KNOWN_MOUSE_KEY].chords.is_empty());
+    }
+
+    #[test]
+    fn nothing_in_an_app_needs_a_default_chord_to_turn_off() {
+        let mut state = state_with_a_known_mouse();
+        let _ = state.set_editing_app(Some(SAFARI.into()));
+        let _ = state.commit_chord(id(), Action::None);
+        assert!(
+            state.app_profiles().next().is_none(),
+            "no entry, so no empty profile"
+        );
+
+        let _ = state.set_editing_app(None);
+        let _ = state.commit_chord(id(), Action::Copy);
+        let _ = state.set_editing_app(Some(SAFARI.into()));
+        let _ = state.commit_chord(id(), Action::None);
+        assert_eq!(standing(&state), [(Action::Copy, ChordStanding::TurnedOff)]);
+        let runs = |app| chords_for(&state.config, Some(KNOWN_MOUSE_KEY), app);
+        assert!(runs(Some(SAFARI)).is_empty(), "off in that application");
+        assert_eq!(runs(None).len(), 1, "still on everywhere else");
+    }
+
+    /// With the Default chord gone an app's own action is simply its chord, and
+    /// an app that only turned it off has no profile left.
+    #[test]
+    fn removing_a_default_chord_leaves_only_what_apps_set_themselves() {
+        let mut state = state_with_a_known_mouse();
+        let _ = state.commit_chord(id(), Action::Copy);
+        let _ = state.set_editing_app(Some(SAFARI.into()));
+        let _ = state.commit_chord(id(), Action::Paste);
+        let _ = state.set_editing_app(Some("off".into()));
+        let _ = state.commit_chord(id(), Action::None);
+
+        let _ = state.set_editing_app(None);
+        let _ = state.clear_chord(id());
+
+        assert_eq!(state.app_profiles().collect::<Vec<_>>(), [(SAFARI, 1)]);
+        let _ = state.set_editing_app(Some(SAFARI.into()));
+        assert_eq!(standing(&state), [(Action::Paste, ChordStanding::AppOnly)]);
+    }
+
+    #[test]
+    fn a_stored_nothing_in_the_default_profile_is_no_chord_to_inherit() {
+        let mut state = state_with_a_known_mouse();
+        state.config.edit(|config| {
+            config.set_chord(KNOWN_MOUSE_KEY, id(), Some(Action::None));
+        });
+        assert!(standing(&state).is_empty());
+        let _ = state.set_editing_app(Some(SAFARI.into()));
+        assert!(standing(&state).is_empty());
+        let _ = state.commit_chord(id(), Action::Copy);
+        assert_eq!(standing(&state), [(Action::Copy, ChordStanding::AppOnly)]);
+    }
+
+    #[test]
+    fn a_chord_save_sends_the_agent_one_reload() {
+        let resolver = AssetResolver::new();
+        let (commands, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut state = AppState::new(Sources {
+            inventories: &[direct_inventory([0xa3, 0x93, 0xca, 0xe0])],
+            ..Sources::in_memory(Config::ephemeral(), &resolver, commands)
+        });
+        while receiver.try_recv().is_ok() {}
+        let _ = state.commit_chord(id(), Action::Copy);
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(crate::services::ipc::Command::ReloadConfig(_))
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+}

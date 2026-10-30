@@ -266,6 +266,7 @@ fn buttons_tab(
     v_flex()
         .flex_1()
         .w_full()
+        .min_w_0()
         .min_h_0()
         .children(button_profile_scope_bar(profile_icons, app_catalog, cx))
         .child(mouse_model.clone())

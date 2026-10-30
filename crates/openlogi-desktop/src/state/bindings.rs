@@ -3,10 +3,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use openlogi_core::binding::{
-    Action, Binding, ButtonId, GestureDirection, LongPressBinding, WheelHoldBinding,
+    Action, Binding, ButtonId, ChordId, GestureDirection, LongPressBinding, WheelHoldBinding,
 };
-use openlogi_core::bindings::{bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
-use openlogi_core::config::{Config, KeyTrigger};
+use openlogi_core::bindings::{
+    bindings_for, chord_is_deliverable, hidpp_gesture_maps_for, oshook_gestures_for,
+};
+use openlogi_core::config::{Config, KeyTrigger, chords_supported};
 use tracing::debug;
 
 use crate::features::mouse::thumbwheel::{ThumbwheelPair, ThumbwheelPreset};
@@ -22,6 +24,74 @@ use super::{AppState, DeviceKey, StateEvent};
 struct EditingScope {
     persistent_key: String,
     app: String,
+}
+
+/// How a chord stands in the open profile, which decides what its row offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChordStanding {
+    /// The device's chord, seen from the Default profile.
+    Default,
+    /// The application runs the Default chord as it is.
+    Inherited,
+    /// The application runs the Default chord with its own action.
+    Overridden,
+    /// The application turns the Default chord off.
+    TurnedOff,
+    /// Only the application has this chord.
+    AppOnly,
+}
+
+/// One chord as the open profile sees it. A chord is one entry whichever member
+/// it is read from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChordEntry {
+    pub id: ChordId,
+    /// What it runs in this profile. For [`ChordStanding::TurnedOff`], what
+    /// the Default profile runs, which using the default brings back.
+    pub action: Action,
+    pub standing: ChordStanding,
+    /// Whether both members can reach the runtime with today's settings.
+    pub deliverable: bool,
+}
+
+/// Every chord of `key` in the profile of `app`, or in the Default profile with
+/// `None`. Reads the exact profile key, as [`Config::per_app_overrides`] does,
+/// because this answers what the user authored there.
+fn chord_entries(config: &Config, key: &str, app: Option<&str>) -> Vec<ChordEntry> {
+    let Some(device) = config.devices.get(key) else {
+        return Vec::new();
+    };
+    // `Action::None` means no chord, so it is no Default for an app to inherit.
+    let default = |id: &ChordId| device.chords.get(id).filter(|a| **a != Action::None);
+    let overlay = app.and_then(|app| device.per_app_chords.get(app));
+    let entry = |id: ChordId, action: &Action, standing| ChordEntry {
+        id,
+        action: action.clone(),
+        standing,
+        deliverable: chord_is_deliverable(config, id),
+    };
+    let mut entries: Vec<ChordEntry> = device
+        .chords
+        .iter()
+        .filter(|(id, _)| default(id).is_some())
+        .map(
+            |(id, action)| match (app, overlay.and_then(|overlay| overlay.get(id))) {
+                (None, _) => entry(*id, action, ChordStanding::Default),
+                (Some(_), None) => entry(*id, action, ChordStanding::Inherited),
+                (Some(_), Some(Action::None)) => entry(*id, action, ChordStanding::TurnedOff),
+                (Some(_), Some(own)) => entry(*id, own, ChordStanding::Overridden),
+            },
+        )
+        .collect();
+    entries.extend(
+        overlay
+            .into_iter()
+            .flatten()
+            .filter(|(id, action)| default(id).is_none() && **action != Action::None)
+            .map(|(id, action)| entry(*id, action, ChordStanding::AppOnly)),
+    );
+    entries.sort_by_key(|entry| entry.id);
+    entries
 }
 
 /// Binding-editor state projected from the persisted configuration.
@@ -259,6 +329,59 @@ impl AppState {
         events
     }
 
+    /// Set `chord`'s action in the profile [`AppState::editing_app`] has open.
+    ///
+    /// [`Action::None`] means no chord. In an application it turns the Default
+    /// chord off there; with no Default chord to turn off, or in the Default
+    /// profile, it removes the entry.
+    ///
+    /// Disk failures restore the persisted chords and surface a config error.
+    pub fn commit_chord(&mut self, chord: ChordId, action: Action) -> StateEvents {
+        let Some(key) = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key)
+            .map(str::to_string)
+        else {
+            debug!(%chord, "no persistent device key: chord edit ignored");
+            return self.for_current_device(StateEvent::BindingsChanged);
+        };
+        let app = self.editing_app().map(str::to_string);
+        self.config.edit(|config| {
+            let turns_off_default = app.is_some()
+                && config
+                    .devices
+                    .get(&key)
+                    .and_then(|device| device.chords.get(&chord))
+                    .is_some_and(|action| *action != Action::None);
+            let action = (action != Action::None || turns_off_default).then_some(action);
+            match &app {
+                Some(app) => config.set_per_app_chord(&key, app, chord, action),
+                None => config.set_chord(&key, chord, action),
+            }
+        });
+        self.persist_and_reload("chord");
+        self.for_current_device(StateEvent::BindingsChanged)
+    }
+
+    /// Drop `chord` from the open profile: the Default profile loses it, and
+    /// an application inherits the Default profile's chord again.
+    pub fn clear_chord(&mut self, chord: ChordId) -> StateEvents {
+        let Some(key) = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key)
+            .map(str::to_string)
+        else {
+            return self.for_current_device(StateEvent::BindingsChanged);
+        };
+        let app = self.editing_app().map(str::to_string);
+        self.config.edit(|config| match &app {
+            Some(app) => config.set_per_app_chord(&key, app, chord, None),
+            None => config.set_chord(&key, chord, None),
+        });
+        self.persist_and_reload("chord");
+        self.for_current_device(StateEvent::BindingsChanged)
+    }
+
     /// Remove the whole assignment in the open scope. The default scope
     /// returns to the device's native/default behavior; an app scope inherits
     /// the device default again. Unlike `Action::None`, this does not suppress
@@ -330,11 +453,11 @@ impl AppState {
     /// save restores both sections and leaves both editor selections intact.
     pub fn remove_all_app_profiles(&mut self, key: &DeviceKey, app: &str) -> StateEvents {
         let changed = self.config.edit(|config| {
-            let Some(device) = config.devices.get_mut(key.as_str()) else {
-                return false;
-            };
-            let buttons = device.per_app_bindings.remove(app).is_some();
-            let ring = device.action_ring.per_app.remove(app).is_some();
+            let buttons = config.remove_app_profile(key.as_str(), app);
+            let ring = config
+                .devices
+                .get_mut(key.as_str())
+                .is_some_and(|device| device.action_ring.per_app.remove(app).is_some());
             buttons || ring
         });
         if changed && !self.persist_and_reload("all application profiles") {
@@ -390,6 +513,32 @@ impl AppState {
             .and_then(DeviceRecord::persistent_config_key)?;
         self.editing_app()
             .and_then(|app| self.config.per_app_overrides(key, app))
+    }
+
+    /// The chords of the open profile, or `None` where chords cannot be edited:
+    /// a platform that does not run them, or a device with no saved identity.
+    #[must_use]
+    pub fn chord_entries(&self) -> Option<Vec<ChordEntry>> {
+        let key = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key)
+            .filter(|_| chords_supported())?;
+        Some(chord_entries(&self.config, key, self.editing_app()))
+    }
+
+    /// How many chord entries the open per-app profile stores. Zero in the
+    /// Default profile, which has nothing to override.
+    #[must_use]
+    pub fn editing_app_chord_count(&self) -> usize {
+        let Some(key) = self
+            .current_record()
+            .and_then(DeviceRecord::persistent_config_key)
+        else {
+            return 0;
+        };
+        self.editing_app()
+            .and_then(|app| self.config.per_app_chord_overrides(key, app))
+            .map_or(0, BTreeMap::len)
     }
 
     /// Apply one paired thumb-wheel preset atomically. Both directional

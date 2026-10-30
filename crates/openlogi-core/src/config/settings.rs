@@ -494,6 +494,26 @@ impl ChordWindow {
     pub const MAX_MS: u16 = 150;
     /// Out-of-the-box window.
     pub const DEFAULT_MS: u16 = 50;
+    /// [`Self::MIN_MS`] as a window.
+    pub const MIN: Self = Self(Self::MIN_MS);
+    /// [`Self::MAX_MS`] as a window.
+    pub const MAX: Self = Self(Self::MAX_MS);
+    /// [`Self::DEFAULT_MS`] as a window.
+    pub const DEFAULT: Self = Self(Self::DEFAULT_MS);
+    /// The step between two windows Settings offers.
+    pub const STEP_MS: u16 = 5;
+
+    /// The nearest step to a floating-point slider value, inside the range.
+    #[must_use]
+    pub fn from_rounded(value: f32) -> Self {
+        let step = f32::from(Self::STEP_MS);
+        let stepped = if value.is_nan() {
+            f32::from(Self::MIN_MS)
+        } else {
+            (value / step).round() * step
+        };
+        stepped.saturating_as::<u16>().into()
+    }
 
     /// The window as a [`Duration`].
     #[must_use]
@@ -504,7 +524,7 @@ impl ChordWindow {
 
 impl Default for ChordWindow {
     fn default() -> Self {
-        Self(Self::DEFAULT_MS)
+        Self::DEFAULT
     }
 }
 
@@ -517,6 +537,12 @@ impl From<u16> for ChordWindow {
 impl From<ChordWindow> for u16 {
     fn from(window: ChordWindow) -> Self {
         window.0
+    }
+}
+
+impl From<ChordWindow> for f32 {
+    fn from(window: ChordWindow) -> Self {
+        Self::from(window.0)
     }
 }
 

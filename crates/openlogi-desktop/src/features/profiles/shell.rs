@@ -80,8 +80,10 @@ fn profile_scope_content(shell: ProfileScopeShell, pal: Palette) -> impl IntoEle
             let selected = shell.model.editing_app.as_deref() == Some(profile.app.as_str());
             let app = profile.app.clone();
             let actions = shell.actions.clone();
+            let tab_id = format!("{}:app:{}", shell.id_base, profile.app);
+            let selector = tab_id.clone();
             profile_tab(
-                format!("{}:app:{}", shell.id_base, profile.app),
+                tab_id,
                 profile.name.clone(),
                 Some(application_mark(
                     shell.icons.state(&profile.icon),
@@ -92,6 +94,7 @@ fn profile_scope_content(shell: ProfileScopeShell, pal: Palette) -> impl IntoEle
                 selected,
                 pal,
             )
+            .debug_selector(move || selector)
             .on_click(move |_event, _window, cx| {
                 actions.select(Some(app.clone()), cx);
             })

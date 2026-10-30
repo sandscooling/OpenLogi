@@ -13,7 +13,9 @@ use gpui_component::{
     input::{InputEvent, InputState},
     v_flex,
 };
-use openlogi_core::binding::{Action, ButtonId, GestureDirection};
+use openlogi_core::binding::{Action, ButtonId, ChordId, GestureDirection};
+use openlogi_core::config::ChordWindow;
+use openlogi_core::device::Capabilities;
 
 use super::force_sensing::{ForceSensingFacts, ForceSensingSlider, PressForce};
 use super::geometry::{
@@ -22,7 +24,8 @@ use super::geometry::{
 };
 use super::hotspots::{Hotspot, MOUSE_MODEL_SIZE, MouseControlId, default_hotspots};
 use super::inspector::{
-    ActionPickerContext, BindingInspectorData, InvalidDrafts, ShortcutMode, binding_inspector,
+    ActionPickerContext, BindingInspectorData, ChordData, InspectorPicker, InvalidDrafts,
+    ShortcutMode, binding_inspector, chord_controls,
 };
 use super::leader_lines::{Geometry as LeaderGeometry, Label, paint as paint_leader_lines};
 use crate::app::{glow_canvas, keyboard_glow};
@@ -30,7 +33,7 @@ use crate::features::binding_editor::{Recording, RecordsShortcut, ShortcutRecord
 use crate::features::keyboard::editors::{PowerUserKind, text_editor_placeholder};
 use crate::features::profiles::{profile_canvas_status, profile_name};
 use crate::services::assets::{GlowGeometry, ResolvedAsset};
-use crate::state::{AppState, DeviceKey, DeviceRecord, StateEvent};
+use crate::state::{AppState, ChordEntry, DeviceKey, DeviceRecord, StateEvent};
 use crate::ui::theme::{self, ACCENT_BLUE};
 
 const SIDE_GAP: f32 = 24.;
@@ -67,12 +70,14 @@ struct MouseWorkspaceData<'a> {
     bindings: &'a BTreeMap<ButtonId, Action>,
     gesture_maps: &'a BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
     glow: Option<(Arc<GlowGeometry>, Hsla)>,
-    thumbwheel: bool,
-    dpi_gestures: bool,
-    virtual_thumbwheel: bool,
+    capabilities: Option<Capabilities>,
     wheel_hold: &'a BTreeSet<ButtonId>,
     editing_app: Option<String>,
     overridden: Option<&'a BTreeMap<ButtonId, Action>>,
+    /// The open profile's chords, or `None` where they cannot be edited.
+    chords: Option<Vec<ChordEntry>>,
+    chord_overrides: usize,
+    chord_window: ChordWindow,
 }
 
 impl<'a> MouseWorkspaceData<'a> {
@@ -89,21 +94,15 @@ impl<'a> MouseWorkspaceData<'a> {
             glow: state
                 .current_record()
                 .and_then(|record| keyboard_glow(state, record)),
-            thumbwheel: state
+            capabilities: state
                 .current_record()
-                .and_then(|record| record.capabilities)
-                .is_some_and(|capabilities| capabilities.thumbwheel),
-            dpi_gestures: state
-                .current_record()
-                .and_then(|record| record.capabilities)
-                .is_some_and(|capabilities| capabilities.dpi_gestures),
-            virtual_thumbwheel: state
-                .current_record()
-                .and_then(|record| record.capabilities)
-                .is_some_and(|capabilities| capabilities.virtual_thumbwheel),
+                .and_then(|record| record.capabilities),
             wheel_hold: state.wheel_hold_buttons(),
             editing_app: state.editing_app().map(|app| profile_name(state, app)),
             overridden: state.editing_app_overrides(),
+            chords: state.chord_entries(),
+            chord_overrides: state.editing_app_chord_count(),
+            chord_window: state.app_settings().chords.window_ms,
         })
     }
 
@@ -118,12 +117,13 @@ impl<'a> MouseWorkspaceData<'a> {
             bindings: &NO_BINDINGS,
             gesture_maps: &NO_GESTURE_MAPS,
             glow: None,
-            thumbwheel: false,
-            dpi_gestures: false,
-            virtual_thumbwheel: false,
+            capabilities: None,
             wheel_hold: &NO_WHEEL_HOLD,
             editing_app: None,
             overridden: None,
+            chords: None,
+            chord_overrides: 0,
+            chord_window: ChordWindow::DEFAULT,
         }
     }
 }
@@ -136,7 +136,7 @@ pub struct MouseModelView {
     selected: Option<MouseControlId>,
     /// The gesture direction whose action is open in the fixed inspector.
     gesture_active_dir: Option<GestureDirection>,
-    action_picker_open: bool,
+    picker: InspectorPicker,
     action_search: Entity<InputState>,
     pub(super) custom_shortcut_input: Entity<InputState>,
     pub(super) custom_application_input: Entity<InputState>,
@@ -208,6 +208,7 @@ impl MouseModelView {
                     | StateEvent::BindingsChanged(_)
                     | StateEvent::LightingChanged(_)
                     | StateEvent::ForceSensingChanged(_)
+                    | StateEvent::SettingsChanged
             )
         });
         Self {
@@ -216,7 +217,7 @@ impl MouseModelView {
             hovered: None,
             selected: None,
             gesture_active_dir: None,
-            action_picker_open: false,
+            picker: InspectorPicker::Closed,
             action_search,
             custom_shortcut_input,
             custom_application_input,
@@ -253,18 +254,50 @@ impl MouseModelView {
     /// `cx.notify()` to re-render.
     pub(crate) fn set_gesture_selected_dir(&mut self, dir: Option<GestureDirection>) {
         self.gesture_active_dir = dir;
-        self.action_picker_open = false;
-        self.shortcut_recorder = None;
+        self.close_action_picker();
     }
 
     pub(super) fn toggle_action_picker(&mut self) {
-        self.action_picker_open = !self.action_picker_open;
+        self.picker = if self.picker == InspectorPicker::Action {
+            InspectorPicker::Closed
+        } else {
+            InspectorPicker::Action
+        };
         self.shortcut_recorder = None;
     }
 
     pub(super) fn close_action_picker(&mut self) {
-        self.action_picker_open = false;
+        self.picker = InspectorPicker::Closed;
         self.shortcut_recorder = None;
+    }
+
+    /// Open or close the list of buttons a new chord can pair with.
+    pub(super) fn toggle_chord_partner(&mut self) {
+        self.picker = if self.picker == InspectorPicker::ChordPartner {
+            InspectorPicker::Closed
+        } else {
+            InspectorPicker::ChordPartner
+        };
+        self.shortcut_recorder = None;
+    }
+
+    /// Open `chord`'s action picker with nothing left from the last target, or
+    /// close it. Choosing an action is what saves a new chord.
+    pub(super) fn toggle_chord_action(
+        &mut self,
+        chord: ChordId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.picker == InspectorPicker::ChordAction(chord) {
+            self.close_action_picker();
+        } else {
+            self.action_search
+                .update(cx, |search, cx| search.set_value("", window, cx));
+            self.clear_custom_action_drafts(window, cx);
+            self.picker = InspectorPicker::ChordAction(chord);
+        }
+        cx.notify();
     }
 
     /// Start recording the custom shortcut, or stop the recording in
@@ -284,7 +317,7 @@ impl MouseModelView {
     /// The action picker's state, as the inspector reads it.
     fn action_picker_context<'a>(&'a self, view: &'a Entity<Self>) -> ActionPickerContext<'a> {
         ActionPickerContext {
-            open: self.action_picker_open,
+            target: self.picker,
             search: &self.action_search,
             shortcut_input: &self.custom_shortcut_input,
             application_input: &self.custom_application_input,
@@ -297,6 +330,11 @@ impl MouseModelView {
         }
     }
 
+    #[cfg(test)]
+    fn action_picker_open(&self) -> bool {
+        self.picker == InspectorPicker::Action
+    }
+
     fn reset_for_device(&mut self, device_key: Option<DeviceKey>) {
         if self.current_device_key == device_key {
             return;
@@ -305,16 +343,14 @@ impl MouseModelView {
         self.hovered = None;
         self.selected = None;
         self.gesture_active_dir = None;
-        self.action_picker_open = false;
-        self.shortcut_recorder = None;
+        self.close_action_picker();
     }
 
     pub(super) fn select(&mut self, control: MouseControlId) {
         if self.selected != Some(control) {
             self.selected = Some(control);
             self.gesture_active_dir = None;
-            self.action_picker_open = false;
-            self.shortcut_recorder = None;
+            self.close_action_picker();
         }
     }
 }
@@ -418,23 +454,18 @@ impl Render for MouseModelView {
             bindings,
             gesture_maps,
             glow,
-            thumbwheel,
-            dpi_gestures,
-            virtual_thumbwheel,
+            capabilities,
             wheel_hold,
             editing_app,
             overridden,
+            chords,
+            chord_overrides,
+            chord_window,
         } = MouseWorkspaceData::read(cx).unwrap_or_else(MouseWorkspaceData::empty);
 
-        let gesture_buttons: Vec<ButtonId> = gesture_maps
-            .keys()
-            .copied()
-            .filter(|button| {
-                editing_app.is_none()
-                    || !overridden.is_some_and(|overrides| overrides.contains_key(button))
-            })
-            .collect();
+        let gesture_buttons = labelled_gesture_buttons(gesture_maps, overridden);
 
+        let thumbwheel = capabilities.is_some_and(|caps| caps.thumbwheel);
         let viewport_h = f32::from(window.viewport_size().height);
         let viewport_w = f32::from(window.viewport_size().width);
         let ModelLayout {
@@ -452,6 +483,10 @@ impl Render for MouseModelView {
         let hovered = self.hovered;
         let profile_status = profile_canvas_status(cx);
 
+        let chord_controls = chord_controls(
+            &hotspots,
+            capabilities.is_some_and(|caps| caps.haptic_panel),
+        );
         let hotspots_outer = hotspots.clone();
         let labels_outer = labels.clone();
         let leader_canvas = leader_canvas(hotspots, labels, highlight, mouse_left, mouse_w);
@@ -495,11 +530,17 @@ impl Render for MouseModelView {
                 gesture_direction: self.gesture_active_dir,
                 bindings,
                 gesture_maps,
-                dpi_gestures,
-                virtual_thumbwheel,
+                dpi_gestures: capabilities.is_some_and(|caps| caps.dpi_gestures),
+                virtual_thumbwheel: capabilities.is_some_and(|caps| caps.virtual_thumbwheel),
                 wheel_hold,
                 editing_app: editing_app.as_deref(),
                 overridden,
+                chords: chords.as_deref().map(|entries| ChordData {
+                    entries,
+                    controls: &chord_controls,
+                    window: chord_window,
+                }),
+                chord_overrides,
                 press_force: PressForce::of(force_sensing.as_ref(), self.force_sensing.as_ref()),
             },
             self.action_picker_context(&view),
@@ -507,6 +548,19 @@ impl Render for MouseModelView {
         );
         workspace_layout(canvas, profile_status, inspector, &self.focus_handle)
     }
+}
+
+/// The buttons whose labels read as gestures: every gesture-mode button, less
+/// those the open app profile replaced with a single action.
+fn labelled_gesture_buttons(
+    gesture_maps: &BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
+    overridden: Option<&BTreeMap<ButtonId, Action>>,
+) -> Vec<ButtonId> {
+    gesture_maps
+        .keys()
+        .copied()
+        .filter(|button| !overridden.is_some_and(|overrides| overrides.contains_key(button)))
+        .collect()
 }
 
 fn workspace_layout(

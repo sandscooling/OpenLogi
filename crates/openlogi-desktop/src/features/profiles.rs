@@ -318,7 +318,10 @@ pub(crate) fn profile_canvas_status(cx: &App) -> Option<gpui::Div> {
     }
     let editing_app = state.editing_app().map(|app| profile_name(state, app));
     let override_count = state.editing_app_overrides().map_or(0, BTreeMap::len);
-    let summary = profile_summary(editing_app.as_deref(), override_count);
+    let summary = editing_app.as_deref().map_or_else(
+        || tr!("profiles.default_bindings_description"),
+        |app| app_profile_summary(app, override_count, state.editing_app_chord_count()),
+    );
     let active = state
         .active_profile_name()
         .map_or_else(|| tr!("common.default"), gpui::SharedString::from);
@@ -342,20 +345,26 @@ pub(crate) fn profile_canvas_status(cx: &App) -> Option<gpui::Div> {
     )
 }
 
-fn profile_summary(editing_app: Option<&str>, override_count: usize) -> gpui::SharedString {
-    let Some(app) = editing_app else {
-        return tr!("profiles.default_bindings_description");
-    };
-    match override_count {
-        0 => tr!(
+/// What `app`'s profile changes, from its button and chord override counts.
+pub(crate) fn app_profile_summary(
+    app: &str,
+    override_count: usize,
+    chord_count: usize,
+) -> gpui::SharedString {
+    match (override_count, chord_count) {
+        (0, 0) => tr!(
             "profiles.app_profile_no_overrides",
             app => app
         ),
-        1 => tr!(
+        (0, _) => tr!(
+            "profiles.app_profile_chord_only",
+            app => app
+        ),
+        (1, _) => tr!(
             "profiles.app_profile_single_override",
             app => app
         ),
-        count => tr!(
+        (count, _) => tr!(
             "profiles.app_profile_override_count",
             app => app,
             count => count

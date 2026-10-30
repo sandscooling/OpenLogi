@@ -71,6 +71,59 @@ fn chord_tables_round_trip_through_the_file() {
     );
 }
 
+/// Saves patch the user's file rather than replace it, and a key is matched by
+/// its text. A chord spelled by hand must come out as one key, or the next load
+/// would refuse the file for naming it twice. An action also changes shape on
+/// the way: a table for a shortcut, a string for the rest.
+#[test]
+fn edits_patch_a_hand_spelled_chord_into_one_key_that_still_loads() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "schema_version = {SCHEMA_VERSION}\n\n\
+             [devices.mouse.chords]\n\
+             \"Forward+Back\" = \"Copy\"\n\
+             \"Back+MiddleClick\" = {{ CustomShortcut = \"Super+Tab\" }}\n\n\
+             [devices.mouse.per_app_chords.app]\n\
+             \"Forward+Back\" = \"None\"\n"
+        ),
+    )
+    .expect("write config");
+    let id = chord("Back+Forward");
+    let tab = chord("Back+MiddleClick");
+    let shortcut = Action::CustomShortcut("Super+Tab".parse().expect("shortcut"));
+
+    let (mut config, mut file) = ConfigFile::load_from_path(&path).expect("load hand spelling");
+    config.set_chord("mouse", id, Some(shortcut.clone()));
+    config.set_chord("mouse", tab, Some(Action::Paste));
+    config.set_per_app_chord("mouse", "app", id, Some(Action::Paste));
+    file.save(&config).expect("save");
+
+    let saved = fs::read_to_string(&path).expect("read saved config");
+    assert!(!saved.contains("Forward+Back"), "saved: {saved}");
+    assert!(!saved.contains("Back+MiddleClick"), "saved: {saved}");
+    let (mut reloaded, mut file) = ConfigFile::load_from_path(&path).expect("reload");
+    assert_eq!(
+        reloaded.devices["mouse"].chords,
+        config.devices["mouse"].chords
+    );
+    assert_eq!(
+        reloaded.devices["mouse"].per_app_chords,
+        config.devices["mouse"].per_app_chords
+    );
+
+    reloaded.set_chord("mouse", id, Some(Action::Copy));
+    reloaded.set_per_app_chord("mouse", "app", id, None);
+    reloaded.set_chord("mouse", tab, None);
+    reloaded.set_chord("mouse", id, None);
+    file.save(&reloaded).expect("save the removals");
+    let saved = fs::read_to_string(&path).expect("read saved config");
+    assert!(!saved.contains("chords"), "nothing left to write: {saved}");
+    Config::load_from_path(&path).expect("load the emptied file");
+}
+
 #[test]
 fn a_key_naming_an_ineligible_button_fails_to_parse() {
     for key in [
@@ -243,6 +296,128 @@ fn an_untouched_window_stays_out_of_the_file() {
 fn a_chord_counts_as_a_setting_and_survives_key_adoption() {
     let config = parse(CHORDS).expect("parse");
     assert!(config.devices["mouse"].holds_settings());
+}
+
+#[test]
+fn a_floating_chord_window_snaps_to_a_step_inside_the_range() {
+    for (raw, expected) in [
+        (52.0, 50),
+        (53.0, 55),
+        (19.0, 20),
+        (151.0, 150),
+        (f32::NAN, 20),
+        (f32::NEG_INFINITY, 20),
+        (f32::INFINITY, 150),
+    ] {
+        assert_eq!(
+            ChordWindow::from_rounded(raw),
+            ChordWindow::from(expected),
+            "{raw}"
+        );
+    }
+    assert_eq!(
+        ChordWindow::from_rounded(f32::from(ChordWindow::DEFAULT)),
+        ChordWindow::DEFAULT
+    );
+}
+
+#[test]
+fn setting_chords_creates_the_entries_and_clearing_prunes_them() {
+    let id = chord("Back+Forward");
+    let mut config = Config::default();
+    config.set_chord("mouse", id, Some(Action::Copy));
+    config.set_per_app_chord("mouse", "app", id, Some(Action::Paste));
+    assert_eq!(config.devices["mouse"].chords[&id], Action::Copy);
+    assert_eq!(
+        config.devices["mouse"].per_app_chords["app"][&id],
+        Action::Paste
+    );
+
+    config.set_per_app_chord("mouse", "app", id, None);
+    assert!(
+        config.devices["mouse"].per_app_chords.is_empty(),
+        "the empty application map is pruned"
+    );
+    config.set_chord("mouse", id, None);
+    assert!(config.devices["mouse"].chords.is_empty());
+}
+
+#[test]
+fn removing_a_chord_drops_only_the_app_entries_that_turned_it_off() {
+    let other = chord("DpiToggle+GestureButton");
+    let mut config = parse(CHORDS).expect("parse");
+    config.set_per_app_chord("mouse", "org.mozilla.firefox", other, Some(Action::Copy));
+    config.set_per_app_chord(
+        "mouse",
+        "com.example.Off",
+        chord("Back+Forward"),
+        Some(Action::None),
+    );
+
+    config.set_chord("mouse", chord("Back+Forward"), None);
+
+    let overlays = &config.devices["mouse"].per_app_chords;
+    assert!(
+        !overlays.contains_key("com.example.Off"),
+        "an application that only turned it off has nothing left"
+    );
+    assert_eq!(
+        overlays["org.mozilla.firefox"],
+        BTreeMap::from([(other, Action::Copy)]),
+        "another chord of that application stays"
+    );
+    assert_eq!(
+        overlays["com.example.Editor"],
+        BTreeMap::from([(chord("Back+Forward"), Action::Paste)]),
+        "an application's own action is still a chord there"
+    );
+}
+
+/// A profile that holds only chords is a profile wherever chords run, and
+/// elsewhere is left alone instead of showing as an empty one.
+#[test]
+fn a_chord_only_profile_is_a_profile_where_chords_run() {
+    let app = "com.example.Editor";
+    let mut config = parse(CHORDS).expect("parse");
+    config.set_per_app_binding(
+        "mouse",
+        "com.example.Both",
+        ButtonId::Back,
+        Some(Action::Copy),
+    );
+    config.set_per_app_chord(
+        "mouse",
+        "com.example.Both",
+        chord("Back+Forward"),
+        Some(Action::Paste),
+    );
+
+    assert_eq!(config.has_app_override("mouse", app), chords_supported());
+    assert_eq!(
+        config.per_app_chord_overrides("mouse", app).is_some(),
+        chords_supported()
+    );
+    let expected: &[&str] = if chords_supported() {
+        &["com.example.Both", app, "org.mozilla.firefox"]
+    } else {
+        &["com.example.Both"]
+    };
+    assert_eq!(config.app_profiles("mouse").collect::<Vec<_>>(), expected);
+
+    assert_eq!(config.remove_app_profile("mouse", app), chords_supported());
+    assert_eq!(
+        config.devices["mouse"].per_app_chords.contains_key(app),
+        !chords_supported()
+    );
+    assert!(config.remove_app_profile("mouse", "com.example.Both"));
+    assert_eq!(
+        config.devices["mouse"]
+            .per_app_chords
+            .contains_key("com.example.Both"),
+        !chords_supported()
+    );
+    assert!(!config.remove_app_profile("mouse", "com.example.Absent"));
+    assert!(!config.remove_app_profile("absent", app));
 }
 
 #[test]

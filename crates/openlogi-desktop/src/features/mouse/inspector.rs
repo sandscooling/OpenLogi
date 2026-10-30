@@ -9,20 +9,26 @@ use gpui::{
 };
 use gpui_base::Button as BaseButton;
 use gpui_component::{
-    Disableable as _, Icon, IconName, Selectable as _, Sizable as _, button::Button, h_flex,
-    input::InputState, scroll::ScrollableElement as _, v_flex,
+    Disableable as _, Icon, IconName, Selectable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+    h_flex,
+    input::InputState,
+    scroll::ScrollableElement as _,
+    v_flex,
 };
-use openlogi_core::binding::{Action, ButtonId, GestureDirection, default_binding};
+use openlogi_core::binding::{Action, ButtonId, ChordId, GestureDirection, default_binding};
+use openlogi_core::config::ChordWindow;
 
 use super::force_sensing::{PressForce, force_sensing_row};
-use super::hotspots::MouseControlId;
+use super::hotspots::{Hotspot, MouseControlId};
 use super::thumbwheel::ThumbwheelPreset;
 use super::view::MouseModelView;
 use crate::features::binding_editor::{
     GESTURE_BUTTON_ICON, PickFn, action_icon_path, action_rows_matching, application_editor,
     command_editor, editor_section, gesture_direction_icon,
 };
-use crate::state::AppState;
+use crate::features::profiles::app_profile_summary;
+use crate::state::{AppState, ChordEntry, ChordStanding};
 use crate::ui::action::localized_action_label;
 use crate::ui::components::{MenuRow, Toggle, control_button, control_input, toggle_row};
 use crate::ui::theme::{self, ACCENT_BLUE, Palette, Typography as _};
@@ -43,15 +49,42 @@ pub(super) struct BindingInspectorData<'a> {
     pub wheel_hold: &'a BTreeSet<ButtonId>,
     pub editing_app: Option<&'a str>,
     pub overridden: Option<&'a BTreeMap<ButtonId, Action>>,
+    /// The Chords section's facts, absent where chords cannot be edited.
+    pub chords: Option<ChordData<'a>>,
+    /// How many chord entries the open per-app profile stores.
+    pub chord_overrides: usize,
     /// The haptic panel's press-force row, present only while
     /// [`ForceSensingFacts::current`](super::force_sensing::ForceSensingFacts::current)
     /// says it shows.
     pub press_force: Option<PressForce<'a>>,
 }
 
+/// What the Chords section reads.
+#[derive(Clone, Copy)]
+pub(super) struct ChordData<'a> {
+    /// The open profile's chords, whichever button is selected.
+    pub entries: &'a [ChordEntry],
+    /// The device's controls that can be in a chord.
+    pub controls: &'a BTreeSet<ButtonId>,
+    pub window: ChordWindow,
+}
+
+/// What the inspector's one picker is choosing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum InspectorPicker {
+    #[default]
+    Closed,
+    /// An action for the selected button or gesture direction.
+    Action,
+    /// The second button of a new chord.
+    ChordPartner,
+    /// The action of a chord, which is saved only once one is picked.
+    ChordAction(ChordId),
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct ActionPickerContext<'a> {
-    pub open: bool,
+    pub target: InspectorPicker,
     pub search: &'a Entity<InputState>,
     pub shortcut_input: &'a Entity<InputState>,
     pub application_input: &'a Entity<InputState>,
@@ -63,6 +96,13 @@ pub(super) struct ActionPickerContext<'a> {
     pub shortcut_record_focus: &'a FocusHandle,
     pub invalid: InvalidDrafts,
     pub view: &'a Entity<MouseModelView>,
+}
+
+impl ActionPickerContext<'_> {
+    /// Whether the picker is choosing the selected control's own action.
+    fn open(&self) -> bool {
+        self.target == InspectorPicker::Action
+    }
 }
 
 /// Which custom-action editors rejected their last Add, so each shows an
@@ -100,6 +140,7 @@ pub(super) fn binding_inspector(
         None => empty_inspector(
             data.editing_app,
             data.overridden.map_or(0, BTreeMap::len),
+            data.chord_overrides,
             pal,
         ),
         Some(MouseControlId::ThumbwheelRotation) => thumbwheel_inspector(
@@ -113,6 +154,7 @@ pub(super) fn binding_inspector(
     };
 
     v_flex()
+        .debug_selector(|| "button-inspector".into())
         .w(px(INSPECTOR_W))
         .h_full()
         .min_h_0()
@@ -131,23 +173,16 @@ pub(super) fn binding_inspector(
         )
 }
 
-fn empty_inspector(app: Option<&str>, override_count: usize, pal: Palette) -> gpui::Div {
-    let summary = match (app, override_count) {
-        (Some(app), 0) => tr!(
-            "profiles.app_profile_no_overrides",
-            app => app.to_string()
-        ),
-        (Some(app), 1) => tr!(
-            "profiles.app_profile_single_override",
-            app => app.to_string()
-        ),
-        (Some(app), count) => tr!(
-            "profiles.app_profile_override_count",
-            app => app.to_string(),
-            count => count.to_string()
-        ),
-        (None, _) => tr!("profiles.select_device_button_description"),
-    };
+fn empty_inspector(
+    app: Option<&str>,
+    override_count: usize,
+    chord_count: usize,
+    pal: Palette,
+) -> gpui::Div {
+    let summary = app.map_or_else(
+        || tr!("profiles.select_device_button_description"),
+        |app| app_profile_summary(app, override_count, chord_count),
+    );
     v_flex()
         .gap_3()
         .child(inspector_heading(
@@ -178,7 +213,7 @@ fn button_inspector(
         && !overridden
         && gesture_map.is_some()
     {
-        return inherited_gesture_inspector(button, app, picker, pal, cx);
+        return inherited_gesture_inspector(button, app, data, picker, pal, cx);
     }
 
     let action = data
@@ -211,20 +246,7 @@ fn button_inspector(
             pal,
         ))
         .when(overridden, |panel| {
-            let observer = picker.view.clone();
-            panel.child(
-                control_button("inspector-use-default")
-                    .w_full()
-                    .icon(IconName::Undo)
-                    .label(tr!("profiles.use_the_default_profile"))
-                    .on_click(move |_, _, cx| {
-                        AppState::apply(cx, |state| state.clear_app_binding(button));
-                        observer.update(cx, |view, cx| {
-                            view.close_action_picker();
-                            cx.notify();
-                        });
-                    }),
-            )
+            panel.child(use_default_button(button, picker.view))
         })
         .when(can_enable_gestures(button, data.editing_app), |panel| {
             let observer = picker.view.clone();
@@ -257,7 +279,8 @@ fn button_inspector(
             data.press_force
                 .map(|press_force| force_sensing_row(press_force, pal)),
         )
-        .when(picker.open, |panel| {
+        .children(chords_section(button, data, picker, pal, cx))
+        .when(picker.open(), |panel| {
             panel.child(action_library(
                 "inspector-action",
                 Some(&action),
@@ -266,6 +289,22 @@ fn button_inspector(
                 pal,
                 cx,
             ))
+        })
+}
+
+/// Drops the open app profile's override of `button`.
+fn use_default_button(button: ButtonId, view: &Entity<MouseModelView>) -> impl IntoElement {
+    let observer = view.clone();
+    control_button("inspector-use-default")
+        .w_full()
+        .icon(IconName::Undo)
+        .label(tr!("profiles.use_the_default_profile"))
+        .on_click(move |_, _, cx| {
+            AppState::apply(cx, |state| state.clear_app_binding(button));
+            observer.update(cx, |view, cx| {
+                view.close_action_picker();
+                cx.notify();
+            });
         })
 }
 
@@ -353,6 +392,7 @@ fn wheel_hold_row(
 fn inherited_gesture_inspector(
     button: ButtonId,
     app: &str,
+    data: &BindingInspectorData<'_>,
     picker: ActionPickerContext<'_>,
     pal: Palette,
     cx: &Context<MouseModelView>,
@@ -391,7 +431,8 @@ fn inherited_gesture_inspector(
                     });
                 }),
         )
-        .when(picker.open, |panel| {
+        .children(chords_section(button, data, picker, pal, cx))
+        .when(picker.open(), |panel| {
             panel.child(action_library(
                 "inspector-gesture-override",
                 None,
@@ -462,7 +503,8 @@ fn gesture_inspector(
             data.press_force
                 .map(|press_force| force_sensing_row(press_force, pal)),
         )
-        .when(picker.open, |panel| {
+        .children(chords_section(button, data, picker, pal, cx))
+        .when(picker.open(), |panel| {
             panel.child(action_library(
                 "inspector-gesture-action",
                 Some(&current),
@@ -544,6 +586,328 @@ fn gesture_directions(
         )
 }
 
+/// The controls a chord can name on this device: the ones it draws, plus a
+/// haptic panel its measured controls report, which a device image with no
+/// marker for it cannot show.
+pub(super) fn chord_controls(hotspots: &[Hotspot], haptic_panel: bool) -> BTreeSet<ButtonId> {
+    hotspots
+        .iter()
+        .filter_map(|hotspot| hotspot.id.button())
+        .chain(haptic_panel.then_some(ButtonId::HapticPanel))
+        .filter(|button| button.supports_chord())
+        .collect()
+}
+
+/// The selected button's chords in the open profile, and a way to add one. Each
+/// member reads the same entries, so a chord edited from one is the chord the
+/// other shows.
+fn chords_section(
+    button: ButtonId,
+    data: &BindingInspectorData<'_>,
+    picker: ActionPickerContext<'_>,
+    pal: Palette,
+    cx: &Context<MouseModelView>,
+) -> Option<gpui::Div> {
+    let chords = data.chords.filter(|_| button.supports_chord())?;
+    let rows: Vec<(ButtonId, &ChordEntry)> = chords
+        .entries
+        .iter()
+        .filter_map(|entry| Some((entry.id.partner_of(button)?, entry)))
+        .collect();
+    let partners: Vec<ButtonId> = chords
+        .controls
+        .iter()
+        .copied()
+        .filter(|control| *control != button && !rows.iter().any(|(partner, _)| partner == control))
+        .collect();
+    if rows.is_empty() && partners.is_empty() {
+        return None;
+    }
+    let choosing_partner = picker.target == InspectorPicker::ChordPartner;
+    let editing = match picker.target {
+        InspectorPicker::ChordAction(chord) => Some(chord),
+        _ => None,
+    };
+    // A chord that cannot run is not diverted, so it costs its buttons nothing.
+    let mut members: BTreeSet<ButtonId> = rows
+        .iter()
+        .filter(|(_, entry)| entry.deliverable)
+        .flat_map(|(_, entry)| entry.id.members())
+        .chain(editing.into_iter().flat_map(ChordId::members))
+        .collect();
+    if choosing_partner {
+        members.insert(button);
+    }
+    let app = data.editing_app.unwrap_or_default();
+
+    Some(
+        v_flex()
+            .debug_selector(|| "inspector-chords".into())
+            .gap_1()
+            .child(editor_section(tr!("actions.chords"), pal))
+            .children(
+                rows.iter()
+                    .map(|(partner, entry)| chord_row(*partner, entry, app, picker, pal)),
+            )
+            .when(!partners.is_empty(), |section| {
+                let view = picker.view.clone();
+                section.child(
+                    control_button("inspector-add-chord")
+                        .debug_selector(|| "inspector-add-chord".into())
+                        .w_full()
+                        .icon(IconName::Plus)
+                        .label(tr!("actions.add_chord"))
+                        .selected(choosing_partner)
+                        .on_click(move |_, _, cx| {
+                            view.update(cx, |view, cx| {
+                                view.toggle_chord_partner();
+                                cx.notify();
+                            });
+                        }),
+                )
+            })
+            .when(choosing_partner, |section| {
+                section.child(chord_partner_list(button, &partners, picker.view, pal))
+            })
+            .children(chord_notes(&members, chords.window, pal))
+            .children(editing.and_then(|chord| {
+                let partner = chord.partner_of(button)?;
+                let current = rows
+                    .iter()
+                    .find(|(_, entry)| {
+                        entry.id == chord && entry.standing != ChordStanding::TurnedOff
+                    })
+                    .map(|(_, entry)| &entry.action);
+                Some(chord_action_library(
+                    chord, partner, current, picker, pal, cx,
+                ))
+            })),
+    )
+}
+
+/// One chord: the row opens its action, and the trailing button leaves it, in
+/// the way the open profile can. An application cannot remove a Default chord,
+/// only turn it off there, so an inherited chord offers that instead.
+fn chord_row(
+    partner: ButtonId,
+    entry: &ChordEntry,
+    app: &str,
+    picker: ActionPickerContext<'_>,
+    pal: Palette,
+) -> impl IntoElement {
+    let chord = entry.id;
+    let name = tr!("actions.chord_with", button => tr!(partner.translation_key()));
+    let action = match entry.standing {
+        ChordStanding::TurnedOff => tr!("actions.chord_off_in_app", app => app.to_string()),
+        _ => localized_action_label(&entry.action),
+    };
+    let status = match entry.standing {
+        ChordStanding::Default | ChordStanding::TurnedOff => None,
+        ChordStanding::Inherited => Some(tr!("profiles.inherited_from_default")),
+        ChordStanding::Overridden => Some(tr!("actions.overridden_in_app", app => app.to_string())),
+        ChordStanding::AppOnly => Some(tr!("actions.chord_only_in_app", app => app.to_string())),
+    };
+    let accessible_label = format!("{name}: {action}");
+    let view = picker.view.clone();
+    h_flex()
+        .w_full()
+        .items_center()
+        .gap_1()
+        .child(
+            div().flex_1().min_w_0().child(
+                MenuRow::new(format!("inspector-chord-row-{partner:?}"))
+                    .debug_selector(|| format!("inspector-chord-row-{partner:?}"))
+                    .selected(picker.target == InspectorPicker::ChordAction(chord))
+                    .role(Role::Button)
+                    .aria_label(accessible_label)
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(div().truncate().text_body().child(name))
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_caption()
+                                    .text_color(pal.text_muted)
+                                    .child(action),
+                            )
+                            .children(status.map(|status| {
+                                div()
+                                    .truncate()
+                                    .text_caption()
+                                    .text_color(pal.text_muted)
+                                    .child(status)
+                            }))
+                            .when(!entry.deliverable, |row| {
+                                row.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            format!("inspector-chord-unavailable-{partner:?}")
+                                        })
+                                        .text_caption()
+                                        .text_color(pal.text_muted)
+                                        .child(tr!("actions.chord_unavailable")),
+                                )
+                            }),
+                    )
+                    .on_click(move |_, window, cx| {
+                        view.update(cx, |view, cx| {
+                            view.toggle_chord_action(chord, window, cx);
+                        });
+                    }),
+            ),
+        )
+        .child(chord_row_action(partner, entry, app, picker.view))
+}
+
+/// The row's trailing button: remove the chord from this profile, turn off an
+/// inherited one, or go back to the Default profile's.
+fn chord_row_action(
+    partner: ButtonId,
+    entry: &ChordEntry,
+    app: &str,
+    view: &Entity<MouseModelView>,
+) -> impl IntoElement {
+    let chord = entry.id;
+    let (name, icon, label) = match entry.standing {
+        ChordStanding::Default | ChordStanding::AppOnly => (
+            "remove",
+            Icon::new(IconName::Close),
+            tr!("actions.remove_chord"),
+        ),
+        ChordStanding::Inherited => (
+            "turn-off",
+            Icon::empty().path("action-icons/ban.svg"),
+            tr!("actions.turn_off_chord_in_app", app => app.to_string()),
+        ),
+        ChordStanding::Overridden | ChordStanding::TurnedOff => (
+            "use-default",
+            Icon::new(IconName::Undo),
+            tr!("profiles.use_the_default_profile"),
+        ),
+    };
+    let turn_off = entry.standing == ChordStanding::Inherited;
+    let view = view.clone();
+    control_button(format!("inspector-chord-{name}-{partner:?}"))
+        .debug_selector(move || format!("inspector-chord-{name}-{partner:?}"))
+        .ghost()
+        .flex_none()
+        .icon(icon)
+        .tooltip(label)
+        .on_click(move |_, _, cx| {
+            AppState::apply(cx, |state| {
+                if turn_off {
+                    state.commit_chord(chord, Action::None)
+                } else {
+                    state.clear_chord(chord)
+                }
+            });
+            view.update(cx, |view, cx| {
+                view.close_action_picker();
+                cx.notify();
+            });
+        })
+}
+
+/// The buttons a new chord can pair with. Picking one saves nothing until an
+/// action is chosen.
+fn chord_partner_list(
+    button: ButtonId,
+    partners: &[ButtonId],
+    view: &Entity<MouseModelView>,
+    pal: Palette,
+) -> impl IntoElement {
+    v_flex()
+        .gap_0p5()
+        .child(editor_section(tr!("actions.chord_partner_heading"), pal))
+        .children(partners.iter().copied().map(|partner| {
+            let view = view.clone();
+            MenuRow::new(format!("inspector-chord-partner-{partner:?}"))
+                .debug_selector(|| format!("inspector-chord-partner-{partner:?}"))
+                .role(Role::MenuItem)
+                .aria_label(tr!(partner.translation_key()))
+                .child(div().child(tr!(partner.translation_key())))
+                .on_click(move |_, window, cx| {
+                    let Ok(chord) = ChordId::new(button, partner) else {
+                        return;
+                    };
+                    view.update(cx, |view, cx| {
+                        view.toggle_chord_action(chord, window, cx);
+                    });
+                })
+        }))
+}
+
+/// What being in a chord costs the buttons in `members`, in the words of what
+/// the user will notice. Nothing while the button is in no chord.
+fn chord_notes(
+    members: &BTreeSet<ButtonId>,
+    window: ChordWindow,
+    pal: Palette,
+) -> Option<gpui::Div> {
+    if members.is_empty() {
+        return None;
+    }
+    let mut notes = vec![(
+        "inspector-chord-note-delay",
+        tr!("actions.chord_delay_note", ms => u16::from(window).to_string()),
+    )];
+    if members.contains(&ButtonId::Back) || members.contains(&ButtonId::Forward) {
+        notes.push(("inspector-chord-note-tap", tr!("actions.chord_tap_note")));
+    }
+    if members.contains(&ButtonId::MiddleClick) {
+        notes.push((
+            "inspector-chord-note-middle",
+            tr!("actions.chord_middle_note"),
+        ));
+    }
+    Some(
+        v_flex()
+            .gap_1()
+            .pt_1()
+            .px_2()
+            .text_caption()
+            .text_color(pal.text_muted)
+            .children(
+                notes.into_iter().map(|(selector, note)| {
+                    div().debug_selector(move || selector.into()).child(note)
+                }),
+            ),
+    )
+}
+
+fn chord_action_library(
+    chord: ChordId,
+    partner: ButtonId,
+    current: Option<&Action>,
+    picker: ActionPickerContext<'_>,
+    pal: Palette,
+    cx: &Context<MouseModelView>,
+) -> impl IntoElement + use<> {
+    let observer = picker.view.clone();
+    let on_pick: PickFn = Rc::new(move |action, _window, cx| {
+        AppState::apply(cx, |state| state.commit_chord(chord, action));
+        observer.update(cx, |view, cx| {
+            view.close_action_picker();
+            cx.notify();
+        });
+    });
+    v_flex()
+        .gap_1()
+        .child(editor_section(
+            tr!("actions.chord_with", button => tr!(partner.translation_key())),
+            pal,
+        ))
+        .child(action_library(
+            "inspector-chord-action",
+            current,
+            picker,
+            &on_pick,
+            pal,
+            cx,
+        ))
+}
+
 /// Whether the default-profile inspector may promote `button` into gesture
 /// mode. Per-app bindings are single-action overrides, so they cannot carry a
 /// direction map.
@@ -595,7 +959,7 @@ fn thumbwheel_inspector(
             picker,
             pal,
         ))
-        .when(picker.open, |panel| {
+        .when(picker.open(), |panel| {
             panel.child(
                 v_flex()
                     .gap_1()
@@ -711,12 +1075,12 @@ fn selection_card(
 ) -> impl IntoElement {
     let toggle = picker.view.clone();
     let search = picker.search.clone();
-    let opening = !picker.open;
+    let opening = !picker.open();
     let accessible_label = value.clone();
     BaseButton::new(id)
         .debug_selector(move || id.to_string())
         .accessibility_label(accessible_label)
-        .aria_expanded(picker.open)
+        .aria_expanded(picker.open())
         .flex()
         .flex_col()
         .items_stretch()
@@ -756,7 +1120,7 @@ fn selection_card(
                 )
                 .child(
                     svg()
-                        .path(if picker.open {
+                        .path(if picker.open() {
                             "action-icons/chevrons-up.svg"
                         } else {
                             "action-icons/chevrons-down.svg"
@@ -1011,8 +1375,39 @@ mod tests {
             wheel_hold,
             editing_app: None,
             overridden: None,
+            chords: None,
+            chord_overrides: 0,
             press_force: None,
         }
+    }
+
+    #[test]
+    fn a_chord_can_name_only_controls_the_device_has_and_that_can_chord() {
+        let hotspot = |id: ButtonId| Hotspot {
+            id: id.into(),
+            x: 0.,
+            y: 0.,
+            w: 1.,
+            h: 1.,
+        };
+        let drawn = [
+            hotspot(ButtonId::LeftClick),
+            hotspot(ButtonId::RightClick),
+            hotspot(ButtonId::Back),
+            hotspot(ButtonId::Thumbwheel),
+            Hotspot {
+                id: MouseControlId::ThumbwheelRotation,
+                ..hotspot(ButtonId::Back)
+            },
+        ];
+        assert_eq!(
+            chord_controls(&drawn, false),
+            BTreeSet::from([ButtonId::Back])
+        );
+        assert_eq!(
+            chord_controls(&drawn, true),
+            BTreeSet::from([ButtonId::Back, ButtonId::HapticPanel])
+        );
     }
 
     #[test]
