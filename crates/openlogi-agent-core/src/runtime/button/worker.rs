@@ -1,4 +1,4 @@
-//! The button runtime's worker thread: draining commands and inputs, settling long presses, and emitting the events the owner subscribed to.
+//! The button runtime's worker thread: draining commands and inputs, settling long presses and chord windows, and emitting the events the owner subscribed to.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -23,11 +23,12 @@ pub(super) fn run_worker(
             return;
         }
         // Shutdown and invalidation arrive with a `Wake`, so only a pending
-        // long-press threshold is a reason to stop waiting without a command.
+        // long-press threshold or chord window is a reason to stop waiting
+        // without a command.
         let command = match receive_command(events, state.next_deadline()) {
             Ok(command) => command,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if settle_due_long_presses(
+                if settle_due_presses(
                     events,
                     shutdown,
                     shared_generation,
@@ -46,8 +47,8 @@ pub(super) fn run_worker(
             }
         };
         synchronize_generation(&mut state, shared_generation, &mut generation, emit);
-        if state.has_due_long_press(Instant::now()) {
-            if settle_due_long_presses(
+        if state.has_due_press(Instant::now()) {
+            if settle_due_presses(
                 events,
                 shutdown,
                 shared_generation,
@@ -61,7 +62,7 @@ pub(super) fn run_worker(
             continue;
         }
         process_command(&mut state, command, generation, emit);
-        if settle_due_long_presses(
+        if settle_due_presses(
             events,
             shutdown,
             shared_generation,
@@ -93,6 +94,7 @@ fn process_command(
                     press,
                     reason: EndReason::Canceled(CancelReason::StaleHold),
                 });
+                emit_canceled(state.orphaned_chords(), CancelReason::StaleHold, emit);
             }
         }
         ButtonCommand::CancelSource(source) => {
@@ -115,7 +117,7 @@ fn process_command(
     }
 }
 
-pub(super) fn settle_due_long_presses(
+pub(super) fn settle_due_presses(
     events: &mpsc::Receiver<ButtonCommand>,
     shutdown: &mpsc::Receiver<ShutdownRequest>,
     shared_generation: &AtomicU64,
@@ -130,7 +132,7 @@ pub(super) fn settle_due_long_presses(
     // An event handler may have blocked while another thread invalidated
     // this generation. Observe that transition before any overdue timer.
     synchronize_generation(state, shared_generation, generation, emit);
-    let due_presses = state.due_long_presses(Instant::now());
+    let due_presses = state.due_presses(Instant::now());
     if due_presses.is_empty() {
         if let Some(command) = first_command {
             process_command(state, command, *generation, emit);
@@ -191,7 +193,7 @@ pub(super) fn settle_due_long_presses(
         });
     }
 
-    emit_selected_long_presses(state, &due_presses, Instant::now(), &mut |event| {
+    emit_selected_due_presses(state, &due_presses, Instant::now(), &mut |event| {
         deferred.push(event);
     });
     emit_settled_events(deferred, &due_presses, emit);
@@ -267,40 +269,45 @@ pub(super) fn process_input(
     emit: &mut impl FnMut(ButtonRuntimeEvent),
 ) {
     match input {
-        ButtonInput::Down(press) => {
-            if let Some(stale) = state.press(press.clone()) {
-                emit(ButtonRuntimeEvent::Ended {
-                    press: stale,
-                    reason: EndReason::Canceled(CancelReason::RepeatedDown),
-                });
+        ButtonInput::Down(mut press) => {
+            let chord = state.complete_chord(&mut press);
+            if chord.is_none() {
+                emit_committed_chords(state, emit);
             }
-            emit(ButtonRuntimeEvent::Started(press));
+            start_press(state, press, emit);
+            if let Some(chord) = chord {
+                start_press(state, chord, emit);
+            }
         }
         ButtonInput::Up { key, released_at } => {
             if let Some(mut press) = state.release(&key) {
-                if let Some(action) = press.fire_long(released_at) {
+                let owed = press
+                    .commit_chord()
+                    .or_else(|| press.fire_long(released_at));
+                if let Some(action) = owed {
                     emit(ButtonRuntimeEvent::Triggered {
                         press: press.clone(),
                         action,
                     });
                 }
                 emit_released(press, emit);
+                for press in state.orphaned_chords() {
+                    emit(ButtonRuntimeEvent::Ended {
+                        press,
+                        reason: EndReason::Released,
+                    });
+                }
             }
         }
         ButtonInput::Pulse(press) => {
-            if let Some(stale) = state.press(press.clone()) {
-                emit(ButtonRuntimeEvent::Ended {
-                    press: stale,
-                    reason: EndReason::Canceled(CancelReason::RepeatedDown),
-                });
-            }
-            emit(ButtonRuntimeEvent::Started(press.clone()));
+            emit_committed_chords(state, emit);
+            start_press(state, press.clone(), emit);
             if let Some(press) = state.release(&press.token.key) {
                 emit_released(press, emit);
             }
         }
         ButtonInput::TriggerWhilePressed { token, action } => {
-            if let Some(press) = state.active(&token).cloned() {
+            if let Some(press) = state.trigger_target(&token) {
                 emit(ButtonRuntimeEvent::Triggered { press, action });
             }
         }
@@ -308,13 +315,38 @@ pub(super) fn process_input(
     }
 }
 
-pub(super) fn emit_selected_long_presses(
+/// Record a new press, ending any press it proves lost and the chord that
+/// press belonged to.
+fn start_press(
+    state: &mut ButtonState,
+    press: ActivePress,
+    emit: &mut impl FnMut(ButtonRuntimeEvent),
+) {
+    if let Some(stale) = state.press(press.clone()) {
+        emit(ButtonRuntimeEvent::Ended {
+            press: stale,
+            reason: EndReason::Canceled(CancelReason::RepeatedDown),
+        });
+        emit_canceled(state.orphaned_chords(), CancelReason::RepeatedDown, emit);
+    }
+    emit(ButtonRuntimeEvent::Started(press));
+}
+
+/// A press that completed no chord ends every open window, so a held-back solo
+/// runs before the press that interrupted it.
+fn emit_committed_chords(state: &mut ButtonState, emit: &mut impl FnMut(ButtonRuntimeEvent)) {
+    for (press, action) in state.commit_open_chords() {
+        emit(ButtonRuntimeEvent::Triggered { press, action });
+    }
+}
+
+pub(super) fn emit_selected_due_presses(
     state: &mut ButtonState,
     tokens: &[PressToken],
     now: Instant,
     emit: &mut impl FnMut(ButtonRuntimeEvent),
 ) {
-    for (press, action) in state.fire_selected_long_presses(tokens, now) {
+    for (press, action) in state.fire_selected_due_presses(tokens, now) {
         emit(ButtonRuntimeEvent::Triggered { press, action });
     }
 }

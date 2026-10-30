@@ -240,6 +240,33 @@ fn app_switch_cancels_held_buttons_only_when_a_per_app_override_is_involved() {
 }
 
 #[test]
+fn app_switch_cancels_held_buttons_when_only_a_chord_overlay_differs() {
+    let mut config = Config::default();
+    config
+        .devices
+        .entry("a".into())
+        .or_default()
+        .per_app_chords
+        .insert(
+            "editor".into(),
+            [("Back+Forward".parse().expect("valid chord"), Action::Copy)].into(),
+        );
+    let mut orch = orchestrator(config);
+    orch.devices = vec![dev("a", 1, true)];
+    orch.rebuild();
+    let supported = openlogi_core::config::chords_supported();
+    assert!(!orch.set_current_app(Some(ForegroundApp::unnamed("finder".into()))));
+    assert_eq!(
+        orch.set_current_app(Some(ForegroundApp::unnamed("editor".into()))),
+        supported
+    );
+    assert_eq!(
+        orch.set_current_app(Some(ForegroundApp::unnamed("safari".into()))),
+        supported
+    );
+}
+
+#[test]
 fn pointer_profiles_switch_to_desktop_without_changing_keyboard_focus() {
     use openlogi_hook::{PointerContext, PointerTarget};
 

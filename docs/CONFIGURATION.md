@@ -43,6 +43,8 @@ v10 adds the per-device `disabled_keys` policy. Older readers reject a v10
 header before parsing its fields. A v9 file without the policy still loads.
 v11 adds the `[app_settings.click_lock]` table. A v10 file without it loads with
 click lock off, and is stamped v11 by its next save.
+v12 adds the per-device `chords` and `per_app_chords` tables and the
+`[app_settings.chords]` table. A v11 file without them loads with no chords.
 
 ## Shape
 
@@ -71,6 +73,9 @@ optional physical device key.
   needs `capture_mouse_events`, and applies to every Logitech mouse the hook
   grabs, whichever device is selected. The table parses everywhere but only
   Linux acts on it; macOS and Windows ignore it
+- `[app_settings.chords]`: `window_ms` is how long after one chord button the
+  other still makes a chord, from `20` through `150` (default `50`). A value
+  outside that range is clamped to it. See [Chords](#chords)
 - `mouse_profile_target`: `pointer` (default, including existing configs that
   omit this preference) or `focused`. Mouse button profiles follow the window
   under the pointer; the desktop uses the global bindings. Keyboard profiles
@@ -177,6 +182,8 @@ Common device fields are:
   across platforms (see [Application aliases](#application-aliases)). An
   overlay holds one action per button; gesture-direction maps live in
   `bindings`
+- `chords` and `per_app_chords`: two buttons pressed together run an action. See
+  [Chords](#chords)
 - `action_ring`: default and complete per-application eight-slot layouts;
   `action_ring.per_app` takes the same selectors as `per_app_bindings`,
   including the Windows `exe:<filename>` fallback and `app:<alias>` keys
@@ -247,6 +254,64 @@ Common device fields are:
 `[keyboard.bindings]` contains global key triggers such as `f1` or
 `shift+command+f5`. Supported trigger modifiers are `shift`, `control`,
 `option`, and `command`; aliases such as `ctrl`, `alt`, and `cmd` are accepted.
+
+### Chords
+
+Press two buttons together to run any action instead of either button's own.
+There is no GUI for chords yet, so they are set here, per device. They parse on
+every platform, but only Linux acts on them.
+
+```toml
+[devices."<physical-key>".chords]
+"Back+Forward" = "MissionControl"
+"GestureButton+HapticPanel" = { CustomShortcut = "Super+Tab" }
+
+[devices."<physical-key>".per_app_chords."org.mozilla.firefox"]
+"Back+Forward" = "None"
+
+[app_settings.chords]
+window_ms = 50
+```
+
+- A key is two button names joined by `+`, in either order. Writing one pair
+  both ways in the same table is an error. A button can be in several chords.
+- `MiddleClick`, `Back`, `Forward`, `DpiToggle`, `GestureButton`, `HapticPanel`,
+  `WheelTiltLeft` and `WheelTiltRight` can be chord buttons. `LeftClick`,
+  `RightClick`, the thumb wheel and keyboard keys cannot, and a key naming one
+  fails to load.
+- A value is one action from the [action list](#actions), not a binding, so a
+  chord has no long press or gesture of its own. A held action such as
+  `HoldShortcut` runs until the first of the two buttons is released.
+- `per_app_chords` takes the same selectors as `per_app_bindings`. An entry
+  replaces that chord in that application, adds one, or with `"None"` turns it
+  off.
+
+**Chord buttons change, even when pressed alone.** This applies only to a device
+with a chord, and only to its chord buttons:
+
+- A chord button with a plain action waits for the other button. The action runs
+  when `window_ms` ends or when the button is released, whichever comes first, so
+  a quick click loses less than the full window. A button bound to `None` has
+  nothing to wait for. Long press, wheel hold and gesture bindings decide on
+  release anyway, so a chord adds no delay to them.
+- Every chord button is diverted over HID++, in every application, so that a
+  chord that differs per application does not restart capture. `Back` and
+  `Forward` therefore stop being native button 4 and 5 presses: their actions are
+  synthesized as a tap, even in an application whose chord is off (which has no
+  window delay). That also means holding one no longer holds the native button.
+  A `MiddleClick`, `Back` or `Forward` in gesture mode stays on the OS hook, which
+  acts for the selected device only.
+- `MiddleClick` in a chord loses middle-drag and autoscroll the same way, because
+  its solo action becomes a one-shot click. A wheel tilt stops repeating while
+  held, for the same reason.
+- A press of any other button OpenLogi handles during the window runs the waiting
+  action first. Left and right clicks, and any button left native, go straight to
+  the desktop, so they can land before it. Once the window ends, a late second
+  press is an ordinary press.
+- The waiting action is dropped if the pointer leaves its window, the profile
+  changes, or the config reloads during the window.
+- With `capture_mouse_events = false`, a chord naming `MiddleClick`, `Back` or
+  `Forward` does nothing, and its buttons keep their usual behavior.
 
 ### Disabled keys
 

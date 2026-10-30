@@ -14,7 +14,7 @@ use std::sync::mpsc;
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
-use openlogi_core::binding::{Action, Binding, ButtonId, LONG_PRESS_THRESHOLD};
+use openlogi_core::binding::{Action, Binding, ButtonId, ChordId, LONG_PRESS_THRESHOLD};
 use tracing::warn;
 
 use super::ActionDispatchTarget;
@@ -28,10 +28,14 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct CaptureEpoch(u64);
 
+mod chord;
 mod worker;
+use chord::ChordArm;
+pub(crate) use chord::ChordMember;
+pub use chord::ChordTable;
 use worker::run_worker;
 #[cfg(test)]
-use worker::{emit_canceled, emit_selected_long_presses, process_input, settle_due_long_presses};
+use worker::{emit_canceled, emit_selected_due_presses, process_input, settle_due_presses};
 
 /// A capture epoch bound to the config namespace its actions currently use.
 /// The namespace can hot-swap while the epoch remains the task's stable input
@@ -118,6 +122,9 @@ pub(crate) enum PressControl {
     Button(ButtonId),
     /// A function key represented by its platform-neutral macOS keycode.
     Key(u16),
+    /// Two buttons pressed together. No device reports this: the runtime owns
+    /// its lifecycle, for as long as both member presses last.
+    Chord(ChordId),
 }
 
 /// Correlation key shared by consecutive edges from one physical control.
@@ -173,6 +180,9 @@ impl PressToken {
 pub(crate) struct ActivePress {
     token: PressToken,
     behavior: PressBehavior,
+    /// This press's open chord window, if it has one (see [`chord`]). Boxed
+    /// so a press outside every chord stays small and allocates nothing.
+    chord: Option<Box<ChordArm>>,
     target: ActionDispatchTarget,
 }
 
@@ -196,6 +206,13 @@ enum PressBehavior {
     /// The wheel moved during the press, which made it a virtual thumb wheel;
     /// release fires nothing.
     WheelHoldScrolled,
+    /// A chord took this press; release fires nothing and ends it.
+    ChordConsumed,
+    /// A completed chord, which ends with the first of its two member presses.
+    Chord {
+        action: Action,
+        members: Box<[PressToken; 2]>,
+    },
 }
 
 impl PressBehavior {
@@ -222,18 +239,21 @@ impl PressBehavior {
             | Self::Immediate(_)
             | Self::LongPressFired
             | Self::WheelHoldPending { .. }
-            | Self::WheelHoldScrolled => None,
+            | Self::WheelHoldScrolled
+            | Self::ChordConsumed
+            | Self::Chord { .. } => None,
         }
     }
 
     fn start_action(&self) -> Option<&Action> {
         match self {
-            Self::Immediate(action) => Some(action),
+            Self::Immediate(action) | Self::Chord { action, .. } => Some(action),
             Self::LifecycleOnly
             | Self::LongPressPending { .. }
             | Self::LongPressFired
             | Self::WheelHoldPending { .. }
-            | Self::WheelHoldScrolled => None,
+            | Self::WheelHoldScrolled
+            | Self::ChordConsumed => None,
         }
     }
 
@@ -244,7 +264,9 @@ impl PressBehavior {
             Self::LifecycleOnly
             | Self::Immediate(_)
             | Self::LongPressFired
-            | Self::WheelHoldScrolled => None,
+            | Self::WheelHoldScrolled
+            | Self::ChordConsumed
+            | Self::Chord { .. } => None,
         }
     }
 
@@ -282,7 +304,12 @@ impl ActivePress {
         self.token.key.source.device_key()
     }
 
+    /// The action this press runs as it starts. An open chord window holds
+    /// it back, and [`Self::commit_chord`] hands it over if no chord completes.
     pub(crate) fn start_action(&self) -> Option<&Action> {
+        if self.chord.is_some() {
+            return None;
+        }
         self.behavior.start_action()
     }
 
@@ -296,6 +323,24 @@ impl ActivePress {
 
     fn fire_long(&mut self, now: Instant) -> Option<Action> {
         self.behavior.fire_long(now)
+    }
+
+    /// The earliest timer this press is waiting on.
+    fn deadline(&self) -> Option<Instant> {
+        let window = self.chord.as_deref().map(ChordArm::deadline);
+        window.into_iter().chain(self.behavior.deadline()).min()
+    }
+
+    /// Fire whatever is due at `now`: an expired window's held-back solo, or a
+    /// long press.
+    fn fire_due(&mut self, now: Instant) -> Option<Action> {
+        let window_over = self.chord.as_ref().is_some_and(|arm| arm.deadline() <= now);
+        let solo = if window_over {
+            self.commit_chord()
+        } else {
+            None
+        };
+        solo.or_else(|| self.fire_long(now))
     }
 }
 
@@ -401,6 +446,10 @@ impl ButtonState {
             && press.token == *token
         {
             press.behavior.wheel_moved();
+            // A press that already scrolled cannot chord.
+            if press.behavior == PressBehavior::WheelHoldScrolled {
+                press.chord = None;
+            }
         }
     }
 
@@ -420,20 +469,25 @@ impl ButtonState {
         // A lifecycle-only press (a gesture hold) holds no output, and its own
         // swipe may be what changed the hovered window (Next Desktop). Follow
         // the pointer instead of canceling, so one hold can chain swipes; the
-        // press-time focus fallback stays with it.
+        // press-time focus fallback stays with it. A press a chord consumed
+        // holds none either: the chord's own press answers for its output.
         for press in self.active.values_mut() {
-            if press.behavior == PressBehavior::LifecycleOnly
-                && let ActionDispatchTarget::Pointer { target, .. } = &mut press.target
+            if matches!(
+                press.behavior,
+                PressBehavior::LifecycleOnly | PressBehavior::ChordConsumed
+            ) && let ActionDispatchTarget::Pointer { target, .. } = &mut press.target
             {
                 *target = current;
             }
         }
-        self.active.extract_if(|_, press| matches!(press.target, ActionDispatchTarget::Pointer { target, .. } if target != current))
+        let mut ended: Vec<ActivePress> = self.active.extract_if(|_, press| matches!(press.target, ActionDispatchTarget::Pointer { target, .. } if target != current))
             .map(|(_, press)| press)
-            .collect()
+            .collect();
+        ended.extend(self.orphaned_chords());
+        ended
     }
 
-    fn fire_selected_long_presses(
+    fn fire_selected_due_presses(
         &mut self,
         tokens: &[PressToken],
         now: Instant,
@@ -445,33 +499,25 @@ impl ButtonState {
                 if press.token != *token {
                     return None;
                 }
-                press.fire_long(now).map(|action| (press.clone(), action))
+                press.fire_due(now).map(|action| (press.clone(), action))
             })
             .collect()
     }
 
-    /// The earliest long-press threshold still pending, which is the only
-    /// reason the worker has to wake without a command.
+    /// The earliest long-press threshold or chord window still pending, which
+    /// is the only reason the worker has to wake without a command.
     fn next_deadline(&self) -> Option<Instant> {
-        self.active
-            .values()
-            .filter_map(|press| press.behavior.deadline())
-            .min()
+        self.active.values().filter_map(ActivePress::deadline).min()
     }
 
-    fn has_due_long_press(&self, now: Instant) -> bool {
+    fn has_due_press(&self, now: Instant) -> bool {
         self.next_deadline().is_some_and(|deadline| deadline <= now)
     }
 
-    fn due_long_presses(&self, now: Instant) -> Vec<PressToken> {
+    fn due_presses(&self, now: Instant) -> Vec<PressToken> {
         self.active
             .values()
-            .filter(|press| {
-                press
-                    .behavior
-                    .deadline()
-                    .is_some_and(|deadline| deadline <= now)
-            })
+            .filter(|press| press.deadline().is_some_and(|deadline| deadline <= now))
             .map(|press| press.token.clone())
             .collect()
     }
@@ -483,9 +529,12 @@ impl ButtonState {
             .filter(|key| matches(key))
             .cloned()
             .collect();
-        keys.into_iter()
+        let mut ended: Vec<ActivePress> = keys
+            .into_iter()
             .filter_map(|key| self.active.remove(&key))
-            .collect()
+            .collect();
+        ended.extend(self.orphaned_chords());
+        ended
     }
 }
 
@@ -505,16 +554,17 @@ impl ButtonInputHandle {
         button: ButtonId,
         binding: Option<&Binding>,
     ) -> Option<PressToken> {
-        self.try_hook_down_with_target(button, binding, ActionDispatchTarget::capture())
+        self.try_hook_down_with_target(button, binding, None, ActionDispatchTarget::capture())
     }
 
     pub(crate) fn try_hook_down_with_target(
         &self,
         button: ButtonId,
         binding: Option<&Binding>,
+        chord: Option<ChordMember>,
         target: ActionDispatchTarget,
     ) -> Option<PressToken> {
-        self.try_down(ButtonSource::current_hook(), button, binding, target)
+        self.try_down(ButtonSource::current_hook(), button, binding, chord, target)
     }
 
     pub(crate) fn try_hook_up(&self, button: ButtonId) -> bool {
@@ -531,6 +581,7 @@ impl ButtonInputHandle {
         let press = self.new_press(
             PressKey::for_key(ButtonSource::current_hook(), keycode),
             PressBehavior::Immediate(action.clone()),
+            None,
             generation,
             target,
         );
@@ -567,12 +618,14 @@ impl ButtonInputHandle {
         session: &HidppSessionId,
         button: ButtonId,
         binding: Option<&Binding>,
+        chord: Option<ChordMember>,
         target: ActionDispatchTarget,
     ) -> Option<PressToken> {
         self.try_down(
             ButtonSource::Hidpp(session.clone()),
             button,
             binding,
+            chord,
             target,
         )
     }
@@ -592,6 +645,7 @@ impl ButtonInputHandle {
         let press = self.new_press(
             PressKey::new(ButtonSource::Hidpp(session.clone()), button),
             PressBehavior::new(binding, Instant::now()),
+            None,
             generation,
             target,
         );
@@ -654,12 +708,15 @@ impl ButtonInputHandle {
         source: ButtonSource,
         button: ButtonId,
         binding: Option<&Binding>,
+        chord: Option<ChordMember>,
         target: ActionDispatchTarget,
     ) -> Option<PressToken> {
         let generation = self.generation.load(Ordering::Acquire);
+        let pressed_at = Instant::now();
         let press = self.new_press(
             PressKey::new(source, button),
-            PressBehavior::new(binding, Instant::now()),
+            PressBehavior::new(binding, pressed_at),
+            chord.map(|member| Box::new(member.arm(pressed_at))),
             generation,
             target,
         );
@@ -683,6 +740,7 @@ impl ButtonInputHandle {
         &self,
         key: PressKey,
         behavior: PressBehavior,
+        chord: Option<Box<ChordArm>>,
         generation: u64,
         target: ActionDispatchTarget,
     ) -> ActivePress {
@@ -694,6 +752,7 @@ impl ButtonInputHandle {
                 generation,
             },
             behavior,
+            chord,
             target,
         }
     }

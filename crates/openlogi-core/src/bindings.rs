@@ -4,12 +4,12 @@
 //! Keyed by `config_key` (`Option<&str>`) rather than any UI device record so
 //! both the agent and the GUI can build the effective map from a [`Config`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::binding::{
-    Action, Binding, ButtonId, GestureDirection, default_binding, default_binding_for,
+    Action, Binding, ButtonId, ChordId, GestureDirection, default_binding, default_binding_for,
 };
-use crate::config::Config;
+use crate::config::{Config, chords_supported};
 
 /// Effective per-button single-action map for the device `config_key`, with
 /// `app_bundle`'s per-app overlay applied. Unset buttons fall back to
@@ -140,6 +140,54 @@ pub fn oshook_gestures_for(
             Binding::Single(_) | Binding::LongPress(_) | Binding::WheelHold(_) => None,
         })
         .collect()
+}
+
+/// The chords `config_key` runs for `app_bundle`: the device's own with that
+/// application's overlay applied, on a platform that runs chords. Empty for a
+/// device with none, so nothing about such a device changes.
+#[must_use]
+pub fn chords_for(
+    config: &Config,
+    config_key: Option<&str>,
+    app_bundle: Option<&str>,
+) -> BTreeMap<ChordId, Action> {
+    let Some(key) = config_key.filter(|_| chords_supported()) else {
+        return BTreeMap::new();
+    };
+    let mut chords = config.effective_chords(key, app_bundle);
+    chords.retain(|id, _| chord_is_deliverable(config, *id));
+    chords
+}
+
+/// Every button that belongs to a chord of `config_key` in any profile.
+///
+/// Capture diverts this union, not one application's chords: a divert change
+/// restarts the capture session, and a chord that differs per application must
+/// not do that on every focus change. An application with the chord off then
+/// gets the member's action synthesized, with no chord window.
+#[must_use]
+pub fn chord_members_for(config: &Config, config_key: &str) -> BTreeSet<ButtonId> {
+    let Some(device) = config
+        .devices
+        .get(config_key)
+        .filter(|_| chords_supported())
+    else {
+        return BTreeSet::new();
+    };
+    std::iter::once(&device.chords)
+        .chain(device.per_app_chords.values())
+        .flatten()
+        .filter(|(id, action)| **action != Action::None && chord_is_deliverable(config, **id))
+        .flat_map(|(id, _)| id.members())
+        .collect()
+}
+
+/// Whether both of a chord's members can reach the runtime. With the OS hook
+/// opted out, Middle, Back and Forward stay native and report no press, so a
+/// chord naming one could never complete.
+fn chord_is_deliverable(config: &Config, id: ChordId) -> bool {
+    config.app_settings.capture_mouse_events
+        || !id.members().iter().any(|button| button.is_os_hook_button())
 }
 
 #[cfg(test)]

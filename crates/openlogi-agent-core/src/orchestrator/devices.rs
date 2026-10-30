@@ -168,8 +168,9 @@ pub(super) fn configured_dpi(config: &Config, dev: &AgentDevice) -> Option<Dpi> 
 }
 
 /// Whether the button assignments of the device `key` names differ between
-/// `previous` and `config`: its bindings, its per-app bindings, or its
-/// Actions Ring. Logi Options+ ends precision mode on such a change.
+/// `previous` and `config`: its bindings, its chords, either's per-app
+/// overlays, or its Actions Ring. Logi Options+ ends precision mode on such a
+/// change.
 pub(super) fn assignments_changed(previous: &Config, config: &Config, key: &str) -> bool {
     // A device with no entry has the default assignments, so a reload that
     // only creates its entry (a first DPI preset, say) changes nothing.
@@ -178,6 +179,8 @@ pub(super) fn assignments_changed(previous: &Config, config: &Config, key: &str)
     let after = config.devices.get(key).unwrap_or(&empty);
     before.bindings != after.bindings
         || before.per_app_bindings != after.per_app_bindings
+        || before.chords != after.chords
+        || before.per_app_chords != after.per_app_chords
         || before.action_ring != after.action_ring
 }
 

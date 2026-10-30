@@ -996,3 +996,64 @@ async fn a_pointer_only_plan_refresh_keeps_a_held_gesture() {
     scroll.shutdown();
     actions.shutdown();
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn two_downs_from_one_report_fire_their_chord_once() {
+    use crate::runtime::ChordTable;
+    use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
+
+    let (_signal, device_io) = openlogi_hid::device_io_channel();
+    let (ring, mut ring_rx) = mpsc::unbounded_channel();
+    let device_access = DeviceAccess {
+        channel: CaptureChannelSlot::default(),
+        registry: openlogi_hid::ChannelRegistry::default(),
+        receiver_access: ReceiverAccess::default(),
+        device_io,
+        transport_turns: crate::hardware::TransportTurns::default(),
+    };
+    let mut actions =
+        crate::runtime::ActionRuntime::new(Arc::default(), Arc::default(), device_access, ring)
+            .unwrap();
+    let mut scroll = ScrollRuntime::spawn(Arc::new(ScrollPreferences::new(
+        false,
+        VerticalScrollSensitivity::default(),
+    )))
+    .unwrap();
+    let mut dispatcher = InputDispatcher::new(GestureOutputs::new(
+        actions.dispatcher(),
+        scroll.input(),
+        Arc::default(),
+    ));
+
+    // The Actions Ring is the one action that reports over a channel instead
+    // of injecting input, so it can be counted here.
+    let mut config = openlogi_core::config::Config::default();
+    config.app_settings.chords.window_ms = 150.into();
+    config
+        .devices
+        .entry("mouse".into())
+        .or_default()
+        .chords
+        .insert(
+            "Back+Forward".parse().expect("valid chord"),
+            Action::ShowActionsRing,
+        );
+    let mut planned = plan();
+    planned.dispatch.bindings.clear();
+    planned.dispatch.chords = ChordTable::for_device(&config, Some("mouse"), None);
+    let session = live_session_from_plan(7, planned);
+    let id = session.id().clone();
+    for button in [ButtonId::Back, ButtonId::Forward] {
+        dispatcher.dispatch(&id, session.dispatch(), CapturedInput::ButtonDown(button));
+    }
+
+    let shown = tokio::time::timeout(Duration::from_secs(1), ring_rx.recv())
+        .await
+        .expect("the chord fires")
+        .expect("the ring channel stays open");
+    assert_eq!(shown.as_deref(), Some("mouse-a"));
+    actions.shutdown();
+    assert!(ring_rx.try_recv().is_err(), "the chord fires once");
+    scroll.shutdown();
+}

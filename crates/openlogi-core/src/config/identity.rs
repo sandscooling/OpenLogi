@@ -401,6 +401,8 @@ fn fold_maps(device: &mut DeviceConfig, legacy: &mut DeviceConfig, route_key: &s
     fold_map_field!(bindings);
     fold_map_field!(disabled_gestures);
     fold_map_field!(per_app_bindings);
+    fold_map_field!(chords);
+    fold_map_field!(per_app_chords);
     fold_map_field!(camera_profiles);
 }
 
@@ -897,6 +899,33 @@ mod tests {
                 .links
                 .contains_key("receiver:82839805:slot:1")
         );
+    }
+
+    #[test]
+    fn chords_merge_key_by_key() {
+        let chord = "Back+Forward".parse().expect("valid chord");
+        let mut config = Config::default();
+        let legacy = DeviceConfig {
+            chords: std::collections::BTreeMap::from([(chord, Action::Copy)]),
+            per_app_chords: std::collections::BTreeMap::from([(
+                "com.example.App".to_string(),
+                std::collections::BTreeMap::from([(chord, Action::None)]),
+            )]),
+            ..DeviceConfig::default()
+        };
+        config
+            .devices
+            .insert("receiver:82839805:slot:1".to_string(), legacy);
+        config
+            .devices
+            .insert("unit:6be9d300".to_string(), DeviceConfig::default());
+
+        let canonical = PhysicalDeviceKey::parse("unit:6be9d300").expect("valid");
+        config.adopt_route(&canonical, "receiver:82839805:slot:1", None);
+
+        let device = &config.devices["unit:6be9d300"];
+        assert_eq!(device.chords.get(&chord), Some(&Action::Copy));
+        assert!(device.per_app_chords.contains_key("com.example.App"));
     }
 
     #[test]

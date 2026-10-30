@@ -876,6 +876,151 @@ impl LeftButton {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn chord_table() -> ChordTable {
+    let mut config = openlogi_core::config::Config::default();
+    config
+        .devices
+        .entry("mouse".into())
+        .or_default()
+        .chords
+        .insert("Back+Forward".parse().expect("valid chord"), Action::Copy);
+    ChordTable::for_device(&config, Some("mouse"), None)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn left_still_reaches_click_lock_with_chords_configured() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    left.hooks.write().expect("maps").chords = chord_table();
+    left.lock();
+    assert_eq!(left.press(), EventDisposition::Suppress, "unlocking press");
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_chord_member_the_hook_sees_is_suppressed_though_its_action_is_native() {
+    use super::super::button::ButtonRuntimeEvent;
+
+    SUPPRESSED_PRESSES.with_borrow_mut(HashSet::clear);
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let hooks = Arc::new(RwLock::new(HookMaps {
+        chords: chord_table(),
+        bindings: BTreeMap::from([
+            (ButtonId::Back, Action::MouseBack.into()),
+            (ButtonId::MiddleClick, Action::MiddleClick.into()),
+        ]),
+        ..HookMaps::default()
+    }));
+    let mouse = EventDevice {
+        vendor_id: Some(0x046d),
+        product_name: Some("Logitech MX Master 3".into()),
+        ..EventDevice::default()
+    };
+    let edge = |id, pressed| {
+        handle_button(
+            id,
+            pressed,
+            Some(&mouse),
+            &hooks,
+            &NO_WAKE,
+            &dispatcher,
+            || None,
+        )
+    };
+
+    assert_eq!(
+        edge(ButtonId::Back, true),
+        EventDisposition::Suppress,
+        "the chord must be able to claim this press"
+    );
+    let Ok(ButtonRuntimeEvent::Started(press)) = events.recv_timeout(Duration::from_secs(1)) else {
+        panic!("the member's press reaches the runtime");
+    };
+    assert_eq!(press.start_action(), None, "its solo is held back");
+    assert_eq!(edge(ButtonId::Back, false), EventDisposition::Suppress);
+
+    assert_eq!(
+        edge(ButtonId::MiddleClick, true),
+        EventDisposition::PassThrough,
+        "a button in no chord keeps its native click"
+    );
+    assert_eq!(
+        edge(ButtonId::MiddleClick, false),
+        EventDisposition::PassThrough
+    );
+    assert!(owner.shutdown());
+}
+
+/// The hook applies the selected device's maps to every mouse it grabs, and a
+/// diverted button stops reaching it from that device. A press it still sees
+/// came from another mouse, which has no chords of its own to wait for.
+#[cfg(target_os = "linux")]
+#[test]
+fn another_mouse_is_not_held_back_by_the_selected_devices_chords() {
+    SUPPRESSED_PRESSES.with_borrow_mut(HashSet::clear);
+    let (dispatcher, mut owner, events) = test_dispatcher();
+    let mut maps = HookMaps {
+        chords: chord_table(),
+        selected_device: Some("mouse".into()),
+        bindings: BTreeMap::from([(ButtonId::Back, Action::MouseBack.into())]),
+        ..HookMaps::default()
+    };
+    let bolt = openlogi_hid::DeviceRoute::Bolt {
+        receiver_uid: "C0FFEE".into(),
+        slot: 1,
+    };
+    maps.diverted_buttons.record(
+        &crate::runtime::HidppSessionId::with_epoch("mouse", 7),
+        &bolt,
+        ButtonId::Back,
+    );
+    let hooks = Arc::new(RwLock::new(maps));
+    let other_mouse = EventDevice {
+        vendor_id: Some(0x046d),
+        product_name: Some("Logitech M185".into()),
+        ..EventDevice::default()
+    };
+    for pressed in [true, false] {
+        assert_eq!(
+            handle_button(
+                ButtonId::Back,
+                pressed,
+                Some(&other_mouse),
+                &hooks,
+                &NO_WAKE,
+                &dispatcher,
+                || None,
+            ),
+            EventDisposition::PassThrough,
+            "its native Back keeps working, pressed = {pressed}"
+        );
+    }
+    assert!(
+        events.recv_timeout(Duration::from_millis(50)).is_err(),
+        "the press never reaches the runtime"
+    );
+    assert!(owner.shutdown());
+}
+
+#[test]
+fn a_selected_device_hands_a_button_to_hidpp_on_any_route() {
+    let bolt = openlogi_hid::DeviceRoute::Bolt {
+        receiver_uid: "C0FFEE".into(),
+        slot: 1,
+    };
+    let session = crate::runtime::HidppSessionId::with_epoch("mouse", 7);
+    let mut diverted = DivertedButtons::default();
+    diverted.record(&session, &bolt, ButtonId::Back);
+    assert!(diverted.reports_over_hidpp("mouse", ButtonId::Back));
+    assert!(!diverted.reports_over_hidpp("mouse", ButtonId::Forward));
+    assert!(!diverted.reports_over_hidpp("other", ButtonId::Back));
+    diverted.release(&session);
+    assert!(!diverted.reports_over_hidpp("mouse", ButtonId::Back));
+}
+
 #[test]
 fn left_passes_and_queues_nothing_with_click_lock_off() {
     let left = LeftButton::with_hold(None);

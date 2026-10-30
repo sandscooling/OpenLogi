@@ -115,6 +115,19 @@ fn assignments_change_with_bindings_but_not_with_other_settings() {
     per_app.set_per_app_binding("a", "browser", ButtonId::Back, Some(Action::BrowserBack));
     assert!(assignments_changed(&previous, &per_app, "a"));
 
+    let chord = "Back+Forward".parse().expect("valid chord");
+    let mut chorded = previous.clone();
+    let device = chorded.devices.entry("a".into()).or_default();
+    device.chords.insert(chord, Action::Copy);
+    assert!(assignments_changed(&previous, &chorded, "a"));
+
+    let mut per_app_chord = previous.clone();
+    let device = per_app_chord.devices.entry("a".into()).or_default();
+    device
+        .per_app_chords
+        .insert("browser".into(), [(chord, Action::None)].into());
+    assert!(assignments_changed(&previous, &per_app_chord, "a"));
+
     assert!(assignments_changed(&Config::default(), &previous, "a"));
 }
 

@@ -197,6 +197,7 @@ impl InputDispatcher {
                     session,
                     button,
                     binding,
+                    plan.chords.member(button),
                     plan.pointer_target,
                 );
                 if tracks_hold {

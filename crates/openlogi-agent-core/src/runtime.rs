@@ -18,10 +18,11 @@ use std::time::{Duration, Instant};
 use openlogi_core::binding::{Action, Binding, ButtonId};
 use tracing::{debug, info, warn};
 
+pub use self::button::ChordTable;
 use self::button::{
     ButtonInputHandle, ButtonRuntimeEvent, ButtonRuntimeOwner, EndReason, PressControl,
 };
-pub(crate) use self::button::{HidppSessionId, PressToken};
+pub(crate) use self::button::{ChordMember, HidppSessionId, PressToken};
 use crate::hardware::{
     DeviceAccess, toggle_smartshift_in_background, write_pointer_speed_in_background,
 };
@@ -311,6 +312,9 @@ impl ButtonEventHandler {
                         PressControl::Key(keycode) => {
                             info!(keycode, ?reason, "key lifecycle canceled");
                         }
+                        PressControl::Chord(chord) => {
+                            info!(%chord, ?reason, "chord lifecycle canceled");
+                        }
                     }
                 }
             }
@@ -413,10 +417,11 @@ impl ActionDispatcher {
         &self,
         button: ButtonId,
         binding: Option<&Binding>,
+        chord: Option<ChordMember>,
         target: ActionDispatchTarget,
     ) -> Option<PressToken> {
         self.buttons
-            .try_hook_down_with_target(button, binding, target)
+            .try_hook_down_with_target(button, binding, chord, target)
     }
 
     /// Queue one OS-hook up edge without blocking the callback.
@@ -471,12 +476,14 @@ impl ActionDispatcher {
         session: &HidppSessionId,
         button: ButtonId,
         binding: Option<&Binding>,
+        chord: Option<ChordMember>,
         pointer_target: Option<openlogi_hook::PointerTarget>,
     ) -> Option<PressToken> {
         self.buttons.try_hidpp_down(
             session,
             button,
             binding,
+            chord,
             ActionDispatchTarget::for_pointer(pointer_target, openlogi_hook::frontmost_safari_pid),
         )
     }

@@ -12,7 +12,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use openlogi_core::binding::{Action, Binding, ButtonId, GestureDirection, default_binding};
-use openlogi_core::bindings::{button_bindings_for, hidpp_gesture_maps_for, oshook_gestures_for};
+use openlogi_core::bindings::{
+    button_bindings_for, chord_members_for, hidpp_gesture_maps_for, oshook_gestures_for,
+};
 use openlogi_core::config::{Config, ThumbwheelSensitivity};
 use openlogi_core::device_order::PhysicalDeviceKey;
 use openlogi_hid::DeviceRoute;
@@ -21,6 +23,8 @@ use openlogi_hid::session::gesture::{
     CaptureSpec, DIVERTABLE_STANDARD_BUTTONS, GESTURE_SOURCE_BUTTONS,
 };
 use tokio::sync::watch;
+
+use crate::runtime::ChordTable;
 
 /// Hardware identity of one HID++ capture session.
 ///
@@ -53,6 +57,8 @@ pub struct DispatchPlan {
     pub config_key: String,
     /// Per-button immediate or threshold bindings for this device (per-app effective).
     pub bindings: BTreeMap<ButtonId, Binding>,
+    /// This device's chords (per-app effective).
+    pub chords: ChordTable,
     /// Per-direction map for each HID++ gesture source (the dedicated gesture
     /// button, the MX Master 4 haptic panel) in gesture mode on this device,
     /// keyed by the button its captured swipes dispatch as; empty when none
@@ -206,6 +212,26 @@ pub(crate) fn hidpp_side_gesture_maps_for(
         .collect()
 }
 
+/// Whether `binding` on `button` can only run with the control diverted.
+fn binding_needs_divert(button: ButtonId, binding: &Binding) -> bool {
+    // Both decide on release whether the click runs, which only the shared
+    // button runtime can do.
+    if matches!(binding, Binding::LongPress(_) | Binding::WheelHold(_)) {
+        return true;
+    }
+    let action = binding.click_action();
+    // Gesture sources have no host-visible firmware action, so any single
+    // binding needs the divert. `None` leaves them native.
+    if GESTURE_SOURCE_BUTTONS
+        .iter()
+        .any(|(_, source)| *source == button)
+    {
+        action != Action::None
+    } else {
+        action != default_binding(button)
+    }
+}
+
 /// Build one device's plan from the config (per-app effective for `app`).
 #[must_use]
 pub fn plan_for_device(
@@ -218,6 +244,10 @@ pub fn plan_for_device(
     os_mouse_hook_available: bool,
 ) -> DeviceCapturePlan {
     let bindings = button_bindings_for(config, Some(config_key), app);
+    let chords = ChordTable::for_device(config, Some(config_key), app);
+    // The union across profiles, so a chord that differs per application
+    // leaves [`CaptureTarget`] equal and restarts nothing.
+    let chord_members = chord_members_for(config, config_key);
     // Gesture-mode OS-hook controls normally stay native so the hook sees the
     // press. Back/Forward may additionally request device-owned HID++ raw XY:
     // macOS uses it exclusively, while Windows keeps the hook as fallback.
@@ -276,21 +306,12 @@ pub fn plan_for_device(
         .filter(|(_, button)| !oshook.contains_key(button))
         .filter(|entry| !divert_wheel_buttons.contains(entry))
         .filter(|(_, button)| {
-            bindings.get(button).is_some_and(|binding| {
-                // Both decide on release whether the click runs, which only
-                // the shared button runtime can do.
-                if matches!(binding, Binding::LongPress(_) | Binding::WheelHold(_)) {
-                    return true;
-                }
-                let action = binding.click_action();
-                // Gesture sources have no host-visible firmware action, so any
-                // single binding needs the divert. `None` leaves them native.
-                if GESTURE_SOURCE_BUTTONS.iter().any(|(_, source)| source == button) {
-                    action != Action::None
-                } else {
-                    action != default_binding(*button)
-                }
-            })
+            // A chord member's press must not reach the desktop before the
+            // chord can claim it, so even a default binding is diverted.
+            chord_members.contains(button)
+                || bindings
+                    .get(button)
+                    .is_some_and(|binding| binding_needs_divert(*button, binding))
         })
         .collect();
     let thumbwheel_bindings_nondefault = [
@@ -329,6 +350,7 @@ pub fn plan_for_device(
         dispatch: DispatchPlan {
             config_key: config_key.to_owned(),
             bindings,
+            chords,
             gesture_bindings,
             side_gesture_bindings,
             thumbwheel_sensitivity,
@@ -406,6 +428,135 @@ mod tests {
             .divert_buttons
             .iter()
             .any(|&(_, diverted)| diverted == button)
+    }
+
+    fn with_chord(key: &str, chord: &str, action: Action) -> Config {
+        let mut cfg = Config::default();
+        cfg.devices
+            .entry(key.to_owned())
+            .or_default()
+            .chords
+            .insert(chord.parse().expect("valid chord"), action);
+        cfg
+    }
+
+    /// Chords on one device leave every other device's plan exactly as a
+    /// config without them would build it, window setting included.
+    #[test]
+    fn a_device_without_chords_gets_an_unchanged_plan() {
+        let mut without = Config::default();
+        without.set_binding("other", ButtonId::Back, Binding::Single(Action::Paste));
+        let mut with = with_chord("2b042", "Back+Forward", Action::Copy);
+        with.set_binding("other", ButtonId::Back, Binding::Single(Action::Paste));
+        with.app_settings.chords.window_ms = 150.into();
+
+        let plan = plan_for_device(&with, "other", route(), None, 0, true);
+        assert_eq!(
+            plan,
+            plan_for_device(&without, "other", route(), None, 0, true)
+        );
+        assert_eq!(plan.dispatch.chords, ChordTable::default());
+        assert_eq!(plan.dispatch.chords.member(ButtonId::Back), None);
+        assert!(!diverts(&plan, ButtonId::Forward));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_chord_member_is_diverted_though_its_binding_is_the_default() {
+        let cfg = with_chord("2b042", "Back+Forward", Action::Copy);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        assert!(diverts(&plan, ButtonId::Back));
+        assert!(diverts(&plan, ButtonId::Forward));
+        assert!(!diverts(&plan, ButtonId::MiddleClick));
+        assert!(plan.dispatch.chords.member(ButtonId::Back).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hidpp_only_members_are_diverted_though_bound_to_nothing() {
+        // `None` normally leaves a gesture source native, which would keep
+        // its press from ever reaching a chord.
+        let mut cfg = with_chord("2b042", "GestureButton+HapticPanel", Action::Copy);
+        for button in [ButtonId::GestureButton, ButtonId::HapticPanel] {
+            cfg.set_binding("2b042", button, Binding::Single(Action::None));
+        }
+        let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        assert!(diverts(&plan, ButtonId::GestureButton));
+        assert!(diverts(&plan, ButtonId::HapticPanel));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_gesture_mode_source_stays_on_its_raw_xy_divert_as_a_member() {
+        let cfg = with_chord("2b042", "GestureButton+HapticPanel", Action::Copy);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        assert!(
+            plan.target
+                .spec
+                .divert_gesture_sources
+                .contains(&GESTURE_BUTTON_CID),
+            "the gesture button defaults to gesture mode"
+        );
+        assert!(
+            !diverts(&plan, ButtonId::GestureButton),
+            "a raw-XY-diverted source must never also be plain-diverted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn with_the_hook_opted_out_an_os_hook_member_stays_native() {
+        let mut cfg = with_chord("2b042", "Back+GestureButton", Action::Copy);
+        cfg.app_settings.capture_mouse_events = false;
+        let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        assert!(!diverts(&plan, ButtonId::Back));
+        assert!(
+            !diverts(&plan, ButtonId::GestureButton),
+            "its chord can never complete, so its partner stays native too"
+        );
+        assert_eq!(plan.dispatch.chords, ChordTable::default());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_gesture_mode_os_hook_member_stays_on_the_hook() {
+        let mut cfg = with_chord("2b042", "Back+Forward", Action::Copy);
+        cfg.set_gesture_mode("2b042", ButtonId::Back, true);
+        let plan = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        assert!(!diverts(&plan, ButtonId::Back), "the hook owns its swipes");
+        assert!(diverts(&plan, ButtonId::Forward));
+        assert!(plan.dispatch.chords.member(ButtonId::Back).is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_chord_that_differs_per_app_leaves_the_capture_target_equal() {
+        let mut cfg = with_chord("2b042", "Back+Forward", Action::Copy);
+        let device = cfg.devices.get_mut("2b042").expect("device");
+        device.per_app_chords.insert(
+            "org.example.Off".to_owned(),
+            [("Back+Forward".parse().expect("valid chord"), Action::None)].into(),
+        );
+        device.per_app_chords.insert(
+            "org.example.Extra".to_owned(),
+            [(
+                "GestureButton+HapticPanel".parse().expect("valid chord"),
+                Action::Paste,
+            )]
+            .into(),
+        );
+
+        let default = plan_for_device(&cfg, "2b042", route(), None, 0, true);
+        for app in ["org.example.Off", "org.example.Extra", "org.example.Other"] {
+            let plan = plan_for_device(&cfg, "2b042", route(), Some(app), 0, true);
+            assert_eq!(plan.target, default.target, "{app} must not rearm capture");
+        }
+
+        // The app with the chord off is diverted but opens no window.
+        let off = plan_for_device(&cfg, "2b042", route(), Some("org.example.Off"), 0, true);
+        assert!(diverts(&off, ButtonId::Back));
+        assert_eq!(off.dispatch.chords.member(ButtonId::Back), None);
+        assert_ne!(off.dispatch, default.dispatch, "dispatch still hot-swaps");
     }
 
     #[test]

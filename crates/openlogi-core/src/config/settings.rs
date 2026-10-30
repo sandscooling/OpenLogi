@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use az::SaturatingAs;
 use nutype::nutype;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::binding::ButtonId;
 use crate::color::Rgb;
@@ -317,6 +317,11 @@ pub struct AppSettings {
     /// [`Self::capture_mouse_events`] off also turns it off.
     #[serde(default, skip_serializing_if = "ClickLock::is_default")]
     pub click_lock: ClickLock,
+    /// How two-button chords are told from two separate presses. Omitted from
+    /// the file until changed. The chords themselves are per device, in
+    /// [`DeviceConfig::chords`](crate::config::DeviceConfig::chords).
+    #[serde(default, skip_serializing_if = "ChordSettings::is_default")]
+    pub chords: ChordSettings,
 }
 
 /// Whether this platform can act on [`AppSettings::click_lock`].
@@ -442,6 +447,84 @@ impl Default for ClickLockHold {
 impl From<ClickLockHold> for f32 {
     fn from(hold: ClickLockHold) -> Self {
         Self::from(hold.into_inner())
+    }
+}
+
+/// Whether this platform acts on two-button chords.
+///
+/// The one owner of that answer. Chords parse everywhere, but only Linux has
+/// run them, so elsewhere no chord arms, no control is diverted for one, and
+/// no press is held back.
+#[must_use]
+pub const fn chords_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// The `[app_settings.chords]` table.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChordSettings {
+    /// How long after one member's press the other still makes a chord.
+    #[serde(default)]
+    pub window_ms: ChordWindow,
+}
+
+impl ChordSettings {
+    /// `skip_serializing_if` helper: true when nothing diverges from the
+    /// default, so an untouched setting does not clutter `config.toml`.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// The chord window in milliseconds, `20..=150`. A value outside that range is
+/// clamped to it, on load as everywhere else.
+///
+/// Every chord member with a plain action waits up to this long before its
+/// solo action runs, so it is a latency too, not only a tolerance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(into = "u16")]
+pub struct ChordWindow(u16);
+
+impl ChordWindow {
+    /// Shortest window.
+    pub const MIN_MS: u16 = 20;
+    /// Longest window.
+    pub const MAX_MS: u16 = 150;
+    /// Out-of-the-box window.
+    pub const DEFAULT_MS: u16 = 50;
+
+    /// The window as a [`Duration`].
+    #[must_use]
+    pub fn duration(self) -> Duration {
+        Duration::from_millis(u64::from(self.0))
+    }
+}
+
+impl Default for ChordWindow {
+    fn default() -> Self {
+        Self(Self::DEFAULT_MS)
+    }
+}
+
+impl From<u16> for ChordWindow {
+    fn from(ms: u16) -> Self {
+        Self(ms.clamp(Self::MIN_MS, Self::MAX_MS))
+    }
+}
+
+impl From<ChordWindow> for u16 {
+    fn from(window: ChordWindow) -> Self {
+        window.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ChordWindow {
+    /// Reads any integer, so that one too far out to be a `u16` clamps as well
+    /// instead of failing the whole file.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        i64::deserialize(deserializer).map(|ms| ms.saturating_as::<u16>().into())
     }
 }
 
@@ -650,6 +733,7 @@ impl Default for AppSettings {
             lock_key_notifications: true,
             animate_desktop_switch: true,
             click_lock: ClickLock::default(),
+            chords: ChordSettings::default(),
         }
     }
 }

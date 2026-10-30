@@ -7,6 +7,7 @@ use crate::binding::{default_binding, default_gesture_binding};
 use crate::hid::{Dpi, SmartShiftAutoDisengage, SmartShiftThreshold, TunableTorque};
 
 mod app_settings;
+mod chords;
 mod device_settings;
 mod files;
 mod gestures;

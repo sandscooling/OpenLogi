@@ -6,12 +6,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use super::button_map::{deserialize_button_map, deserialize_button_maps_by_app};
+use super::button_map::{deserialize_keyed_map, deserialize_keyed_maps_by_app};
 use super::settings::{
     CameraControls, GestureOwner, LightSettings, Lighting, ScrollResolution, SmartShift,
     ThumbwheelSensitivity, deserialize_gesture_owner,
 };
-use crate::binding::{Action, ActionRingConfig, Binding, ButtonId, GestureDirection};
+use crate::binding::{Action, ActionRingConfig, Binding, ButtonId, ChordId, GestureDirection};
 use crate::device::{Capabilities, DeviceKind, DeviceModelInfo, LightCapabilities};
 use crate::hid::{DisableKeysMask, Dpi, PointerSpeed, ReportRate};
 
@@ -245,6 +245,16 @@ pub struct DeviceConfig {
     /// action, never a per-direction gesture overlay.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,
+    /// Two-button chords: both members pressed together run the action,
+    /// instead of either member's own binding. Keyed by the pair, so one
+    /// button can belong to several chords. [`Action::None`] means no chord.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chords: BTreeMap<ChordId, Action>,
+    /// Per-application chord overlays, keyed like [`Self::per_app_bindings`].
+    /// An entry replaces that chord for the application, and
+    /// [`Action::None`] removes it there.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_app_chords: BTreeMap<String, BTreeMap<ChordId, Action>>,
     /// Host-rendered Actions Ring settings and complete per-application layouts.
     #[serde(default, skip_serializing_if = "ActionRingConfig::is_default")]
     pub action_ring: ActionRingConfig,
@@ -451,6 +461,8 @@ impl Default for DeviceConfig {
             bindings: BTreeMap::new(),
             disabled_gestures: BTreeMap::new(),
             per_app_bindings: BTreeMap::new(),
+            chords: BTreeMap::new(),
+            per_app_chords: BTreeMap::new(),
             action_ring: ActionRingConfig::default(),
             dpi_presets: Vec::new(),
             dpi: None,
@@ -550,19 +562,23 @@ struct RawDeviceConfig {
     #[serde(default)]
     links: BTreeMap<String, LinkConfig>,
     /// v2 shape — present on already-migrated files; wins on any key collision.
-    #[serde(default, deserialize_with = "deserialize_button_map")]
+    #[serde(default, deserialize_with = "deserialize_keyed_map")]
     bindings: BTreeMap<ButtonId, Binding>,
     /// v4 stash of turned-off gesture maps (see [`DeviceConfig::disabled_gestures`]).
-    #[serde(default, deserialize_with = "deserialize_button_map")]
+    #[serde(default, deserialize_with = "deserialize_keyed_map")]
     disabled_gestures: BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
     /// Legacy v1 per-button single bindings.
-    #[serde(default, deserialize_with = "deserialize_button_map")]
+    #[serde(default, deserialize_with = "deserialize_keyed_map")]
     button_bindings: BTreeMap<ButtonId, Action>,
     /// Legacy v1 flat gesture map (implicitly the gesture button's directions).
     #[serde(default)]
     gesture_bindings: BTreeMap<GestureDirection, Action>,
-    #[serde(default, deserialize_with = "deserialize_button_maps_by_app")]
+    #[serde(default, deserialize_with = "deserialize_keyed_maps_by_app")]
     per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,
+    #[serde(default, deserialize_with = "deserialize_keyed_map")]
+    chords: BTreeMap<ChordId, Action>,
+    #[serde(default, deserialize_with = "deserialize_keyed_maps_by_app")]
+    per_app_chords: BTreeMap<String, BTreeMap<ChordId, Action>>,
     #[serde(default)]
     action_ring: ActionRingConfig,
     #[serde(default, deserialize_with = "deserialize_dpi_presets")]
@@ -648,6 +664,8 @@ impl From<RawDeviceConfig> for DeviceConfig {
             bindings,
             disabled_gestures: raw.disabled_gestures,
             per_app_bindings: raw.per_app_bindings,
+            chords: raw.chords,
+            per_app_chords: raw.per_app_chords,
             action_ring: raw.action_ring,
             dpi_presets: raw.dpi_presets,
             dpi: raw.dpi,

@@ -149,6 +149,27 @@ impl ButtonId {
         matches!(self, ButtonId::Back | ButtonId::Forward)
     }
 
+    /// Whether this button can be a member of a two-button chord
+    /// ([`ChordId`](super::ChordId)): a physical control with its own press
+    /// and release that the runtime can hold back. The primary clicks stay
+    /// out because the hook only passes or suppresses them, and click lock
+    /// needs left to pass at once. The thumb wheel reports pulses without a
+    /// release, and keyboard keys are not mouse controls.
+    #[must_use]
+    pub fn supports_chord(self) -> bool {
+        matches!(
+            self,
+            ButtonId::MiddleClick
+                | ButtonId::Back
+                | ButtonId::Forward
+                | ButtonId::DpiToggle
+                | ButtonId::GestureButton
+                | ButtonId::HapticPanel
+                | ButtonId::WheelTiltLeft
+                | ButtonId::WheelTiltRight
+        )
+    }
+
     /// Whether this button is a HID++ gesture source — a control that is
     /// captured over HID++ raw-XY diversion (never the OS hook) and can
     /// therefore own the gesture role with swipe directions: DPI/ModeShift,

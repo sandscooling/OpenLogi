@@ -49,6 +49,7 @@ use crate::notices::LowBatteryWatch;
 use crate::observable::ObservableState;
 use crate::pointer_speed::{AppWrite, ReloadChange, SavedSpeed, SpeedMouse, SpeedWrite};
 use crate::receiver_access::ReceiverAccess;
+use crate::runtime::ChordTable;
 use crate::runtime::hook::{HookMaps, SharedHookMaps};
 use crate::runtime::scroll::ScrollPreferences;
 use crate::watchers::host_switch::{HostSwitchLink, HostSwitchLinks};
@@ -776,6 +777,7 @@ impl Orchestrator {
         }
         let (app, pointer_target) = self.mouse_context();
         let mut bindings = button_bindings_for(&self.config, key, app);
+        let chords = ChordTable::for_device(&self.config, key, app);
         let mut gestures = oshook_gestures_for(&self.config, key, app);
         if cfg!(target_os = "macos")
             && let Some(key) = key
@@ -794,6 +796,7 @@ impl Orchestrator {
         }
         HookMaps {
             bindings,
+            chords,
             gestures,
             pointer_target,
             selected_device: key.map(str::to_owned),
@@ -1774,10 +1777,9 @@ impl Orchestrator {
         // desktops changes the front app and must not end its own hold (#1634).
         let overridden = |app: Option<&str>| {
             app.is_some_and(|app| {
-                self.config
-                    .devices
-                    .keys()
-                    .any(|key| self.config.has_app_override(key, app))
+                self.config.devices.keys().any(|key| {
+                    self.config.has_app_override(key, app) || self.config.has_app_chords(key, app)
+                })
             })
         };
         overridden(previous.as_deref()) || overridden(self.current_app.as_deref())

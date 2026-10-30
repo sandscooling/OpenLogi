@@ -85,7 +85,10 @@ fn v10_without_click_lock_loads_and_a_save_stamps_v11() {
     file.save(&config).expect("save v11 config");
 
     let saved = fs::read_to_string(&path).expect("read saved config");
-    assert!(saved.starts_with("schema_version = 11\n"), "saved: {saved}");
+    assert!(
+        saved.starts_with(&format!("schema_version = {SCHEMA_VERSION}\n")),
+        "saved: {saved}"
+    );
     assert!(
         saved.contains("[app_settings.click_lock]"),
         "saved: {saved}"

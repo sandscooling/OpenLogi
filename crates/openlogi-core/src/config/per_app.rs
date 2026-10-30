@@ -9,9 +9,9 @@
 
 use std::collections::BTreeMap;
 
-use super::Config;
+use super::{Config, chords_supported};
 use crate::app::{overlay_for, profile_key_for};
-use crate::binding::{Action, Binding, ButtonId};
+use crate::binding::{Action, Binding, ButtonId, ChordId};
 
 impl Config {
     /// Resolve the effective binding map for `device_key`, overlaying the
@@ -38,6 +38,29 @@ impl Config {
                 out.insert(*k, Binding::Single(v.clone()));
             }
         }
+        out
+    }
+
+    /// Resolve the chords `device_key` runs for `bundle_id`, overlaying that
+    /// application's `per_app_chords` entry, if any, on the device's `chords`.
+    /// [`Action::None`] means no chord, so an overlay holding it removes the
+    /// chord for that application.
+    #[must_use]
+    pub fn effective_chords(
+        &self,
+        device_key: &str,
+        bundle_id: Option<&str>,
+    ) -> BTreeMap<ChordId, Action> {
+        let Some(device) = self.devices.get(device_key) else {
+            return BTreeMap::new();
+        };
+        let mut out = device.chords.clone();
+        if let Some(bid) = bundle_id
+            && let Some(overlay) = overlay_for(&device.per_app_chords, &self.apps, bid)
+        {
+            out.extend(overlay.iter().map(|(id, action)| (*id, action.clone())));
+        }
+        out.retain(|_, action| *action != Action::None);
         out
     }
 
@@ -121,6 +144,18 @@ impl Config {
         })
     }
 
+    /// Whether `device_key` has a chord overlay for the foreground app `app`,
+    /// on a platform that runs chords. That changes what a held button resolves
+    /// to, as a binding overlay does.
+    #[must_use]
+    pub fn has_app_chords(&self, device_key: &str, app: &str) -> bool {
+        chords_supported()
+            && self.devices.get(device_key).is_some_and(|d| {
+                overlay_for(&d.per_app_chords, &self.apps, app)
+                    .is_some_and(|overlay| !overlay.is_empty())
+            })
+    }
+
     /// The key of the profile `device_key` runs the foreground application
     /// `app` under, matched as [`Self::effective_bindings`] matches it — the
     /// exact key, an `exe:<filename>` key, or an `app:<alias>` key — or `None`
@@ -143,6 +178,7 @@ impl Config {
             device
                 .per_app_bindings
                 .keys()
+                .chain(device.per_app_chords.keys())
                 .chain(device.action_ring.per_app.keys())
                 .find(|key| self.apps.is_undefined_reference(key))
                 .map(|key| (device_key.as_str(), key.as_str()))

@@ -1,5 +1,5 @@
 # OpenLogi configuration example. Copy only the sections you need.
-schema_version = 11
+schema_version = 12
 selected_device = "receiver:aabbccdd:slot:1"
 
 [app_settings]
@@ -30,6 +30,12 @@ animate_desktop_switch = true
 [app_settings.click_lock]
 enabled = false
 hold_ms = 1000
+
+# Linux only: how long after one chord button the other still makes a chord,
+# from 20 to 150 ms. Every chord button with a plain action waits up to this
+# long before that action runs.
+[app_settings.chords]
+window_ms = 50
 
 [devices."receiver:aabbccdd:slot:1"]
 custom_name = "Office mouse"
@@ -75,6 +81,16 @@ MiddleClick = { CustomShortcut = "F1" }
 [devices."receiver:aabbccdd:slot:1".per_app_bindings."app:chrome"]
 Back = "PrevTab"
 Forward = "NextTab"
+
+# Linux only: press two buttons together to run any action. A pair is written
+# in either order. Left and right click cannot be part of a chord.
+[devices."receiver:aabbccdd:slot:1".chords]
+"Back+Forward" = "MissionControl"
+"GestureButton+HapticPanel" = { CustomShortcut = "Super+Tab" }
+
+# `None` turns a chord off in one application, which also removes its delay there.
+[devices."receiver:aabbccdd:slot:1".per_app_chords."com.microsoft.VSCode"]
+"Back+Forward" = "None"
 
 [devices."receiver:aabbccdd:slot:1".action_ring]
 enabled = true

@@ -25,7 +25,7 @@ use openlogi_hook::{
 use tracing::{info, warn};
 
 use super::scroll::ScrollInputHandle;
-use super::{ActionDispatchTarget, ActionDispatcher, PressToken};
+use super::{ActionDispatchTarget, ActionDispatcher, ChordMember, ChordTable, PressToken};
 use crate::event_monitor::SharedEventMonitor;
 use click_lock::ClickLock;
 pub(crate) use diverted::DivertedButtons;
@@ -38,6 +38,10 @@ pub(crate) use diverted::DivertedButtons;
 pub struct HookMaps {
     /// Per-button immediate or threshold binding — the non-gesture dispatch path.
     pub bindings: BTreeMap<ButtonId, Binding>,
+    /// The selected device's chords, for a member the hook sees: one whose
+    /// divert was refused, or that is in OS-hook gesture mode. Capture diverts
+    /// the others, so their presses arrive over HID++ instead.
+    pub chords: ChordTable,
     /// Per-direction maps for the OS-hook gesture buttons (Middle/Back/Forward in
     /// gesture mode), so a hold+swipe resolves to a bound action. HID++
     /// gesture sources use the gesture watcher's separate map instead.
@@ -45,10 +49,6 @@ pub struct HookMaps {
     /// The pointer identity that selected this snapshot, or focused policy.
     pub(crate) pointer_target: Option<openlogi_hook::PointerTarget>,
     /// Device whose binding maps this snapshot contains.
-    #[cfg_attr(
-        not(any(target_os = "windows", test)),
-        expect(dead_code, reason = "read only by the Windows native-wheel fallback")
-    )]
     pub(crate) selected_device: Option<String>,
     /// Click lock's hold time, or `None` while it is off. Read only by a left
     /// press that could start a lock.
@@ -58,11 +58,24 @@ pub struct HookMaps {
     /// Entries survive map rebuilds because they are hardware observations,
     /// not configuration.
     pub(crate) thumbwheel_positive_is_forward: BTreeMap<String, bool>,
-    /// OS-hook buttons that live HID++ capture sessions have diverted on
-    /// directly connected devices, reported by the sessions themselves. Like
-    /// the thumb-wheel polarities, these are hardware observations and
-    /// survive map rebuilds.
+    /// OS-hook buttons that live HID++ capture sessions have diverted,
+    /// reported by the sessions themselves. Like the thumb-wheel polarities,
+    /// these are hardware observations and survive map rebuilds.
     pub(crate) diverted_buttons: DivertedButtons,
+}
+
+impl HookMaps {
+    /// `id`'s place in a chord, for a press of it the hook sees. These maps run
+    /// for every mouse the hook grabs, so once the selected device reports
+    /// `id` over HID++, a press here came from another mouse, which waits for
+    /// no chord of the selected device's.
+    fn chord_member(&self, id: ButtonId) -> Option<ChordMember> {
+        let elsewhere = self
+            .selected_device
+            .as_deref()
+            .is_some_and(|key| self.diverted_buttons.reports_over_hidpp(key, id));
+        self.chords.member(id).filter(|_| !elsewhere)
+    }
 }
 
 /// Shared, atomically-published [`HookMaps`], threaded between the config owner
@@ -322,15 +335,18 @@ fn handle_button(
     }
     // `try_read` only: a blocking read on the tap thread freezes every pointer
     // event while a config rebuild holds the write lock. Fail open if unavailable.
-    let (binding, is_gesture, pointer_target, diverted) =
-        hooks.try_read().map_or((None, false, None, false), |maps| {
-            (
-                maps.bindings.get(&id).cloned(),
-                maps.gestures.contains_key(&id),
-                maps.pointer_target,
-                device.is_some_and(|source| maps.diverted_buttons.owns(source, id)),
-            )
-        });
+    let (binding, chord, is_gesture, pointer_target, diverted) =
+        hooks
+            .try_read()
+            .map_or((None, None, false, None, false), |maps| {
+                (
+                    maps.bindings.get(&id).cloned(),
+                    maps.chord_member(id),
+                    maps.gestures.contains_key(&id),
+                    maps.pointer_target,
+                    device.is_some_and(|source| maps.diverted_buttons.owns(source, id)),
+                )
+            });
     let echoed = ECHOED_PRESSES.with_borrow_mut(|echoes| {
         if pressed {
             echoed_press(id, diverted, echoes)
@@ -355,7 +371,7 @@ fn handle_button(
             if let Some(HoldAdmission::Replace(stale)) = &admission {
                 dispatcher.cancel_stale_hook_press(stale);
             }
-            if let Some(press) = dispatcher.try_hook_button_down(id, None, action_target) {
+            if let Some(press) = dispatcher.try_hook_button_down(id, None, chord, action_target) {
                 HOLD.with_borrow_mut(|h| h.begin(id, press));
                 return EventDisposition::Suppress;
             }
@@ -390,12 +406,14 @@ fn handle_button(
     let Some(binding) = binding else {
         return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, false, s));
     };
-    if binding_is_native_click(id, &binding) {
+    // A chord member's press has to reach the runtime even when its own action
+    // is the native click, or a chord could never take it back.
+    if chord.is_none() && binding_is_native_click(id, &binding) {
         return SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, false, s));
     }
     info!(button = %id, action = %binding.click_action().label(), "button → handling binding");
     let queued = dispatcher
-        .try_hook_button_down(id, Some(&binding), action_target)
+        .try_hook_button_down(id, Some(&binding), chord, action_target)
         .is_some();
     SUPPRESSED_PRESSES.with_borrow_mut(|s| remapped_press_disposition(id, queued, s))
 }

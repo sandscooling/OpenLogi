@@ -1,6 +1,6 @@
-//! The buttons HID++ capture sessions have taken over on directly connected
-//! devices, so the OS hook can tell an echo of a diverted press from a press
-//! only the hook sees (#2158).
+//! The buttons HID++ capture sessions have taken over, so the OS hook can tell
+//! an echo of a diverted press from a press only the hook sees (#2158), and a
+//! press from the session's device from one from another mouse.
 //!
 //! Diverting a `0x1b04` control moves its presses out of the native HID report
 //! and into HID++ notifications, so the OS normally never sees them. Linux
@@ -50,10 +50,13 @@ impl DirectDevice {
     }
 }
 
-/// The OS-hook buttons one capture session diverted on one direct device.
+/// The OS-hook buttons one capture session diverted on one device.
 #[derive(Debug)]
 struct Diversion {
-    device: DirectDevice,
+    /// Config namespace of the device, which every route has.
+    device_key: String,
+    /// OS input identity of the device, which only a direct route names.
+    direct: Option<DirectDevice>,
     buttons: BTreeSet<ButtonId>,
 }
 
@@ -66,24 +69,21 @@ pub(crate) struct DivertedButtons(HashMap<u64, Diversion>);
 
 impl DivertedButtons {
     /// Record that `session` diverted `button` on `route`. Only an OS-hook
-    /// button on a direct route can reach the hook as an echo, so any other
-    /// diversion is not recorded.
+    /// button can reach the hook, so any other diversion is not recorded.
     pub(crate) fn record(
         &mut self,
         session: &HidppSessionId,
         route: &DeviceRoute,
         button: ButtonId,
     ) {
-        let Some(device) = DirectDevice::of(route) else {
-            return;
-        };
         if !button.is_os_hook_button() {
             return;
         }
         self.0
             .entry(session.epoch())
             .or_insert_with(|| Diversion {
-                device,
+                device_key: session.device_key().to_owned(),
+                direct: DirectDevice::of(route),
                 buttons: BTreeSet::new(),
             })
             .buttons
@@ -100,7 +100,18 @@ impl DivertedButtons {
     /// that an OS edge for it is an echo of a press the session reports.
     pub(crate) fn owns(&self, source: &EventDevice, button: ButtonId) -> bool {
         self.0.values().any(|diversion| {
-            diversion.buttons.contains(&button) && diversion.device.is_source_of(source)
+            diversion.buttons.contains(&button)
+                && diversion
+                    .direct
+                    .is_some_and(|device| device.is_source_of(source))
+        })
+    }
+
+    /// Whether the device `device_key` names reports `button` over HID++, so
+    /// that a press the hook sees that is not an echo came from another mouse.
+    pub(crate) fn reports_over_hidpp(&self, device_key: &str, button: ButtonId) -> bool {
+        self.0.values().any(|diversion| {
+            diversion.device_key == device_key && diversion.buttons.contains(&button)
         })
     }
 }

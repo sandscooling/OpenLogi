@@ -10,6 +10,7 @@ fn hook_press(id: u64, button: ButtonId) -> ActivePress {
     ActivePress {
         token: PressToken::hook_for_test(id, button),
         behavior: PressBehavior::Immediate(Action::Copy),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     }
 }
@@ -26,6 +27,7 @@ fn hook_press_bound(id: u64, binding: &Binding) -> ActivePress {
     ActivePress {
         token: PressToken::hook_for_test(id, ButtonId::Back),
         behavior: PressBehavior::new(Some(binding), Instant::now()),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     }
 }
@@ -75,13 +77,13 @@ fn recv_event(receiver: &mpsc::Receiver<ButtonRuntimeEvent>) -> ButtonRuntimeEve
         .expect("button worker should emit an event")
 }
 
-fn emit_due_long_presses(
+fn emit_due_presses(
     state: &mut ButtonState,
     now: Instant,
     emit: &mut impl FnMut(ButtonRuntimeEvent),
 ) {
-    let due_presses = state.due_long_presses(now);
-    emit_selected_long_presses(state, &due_presses, now, emit);
+    let due_presses = state.due_presses(now);
+    emit_selected_due_presses(state, &due_presses, now, emit);
 }
 
 #[test]
@@ -161,6 +163,7 @@ fn a_scrolled_hidpp_wheel_hold_press_ends_without_its_click() {
             &session,
             ButtonId::Back,
             Some(&binding),
+            None,
             ActionDispatchTarget::Keyboard,
         )
         .expect("down should be queued");
@@ -204,6 +207,7 @@ fn cancellation_is_scoped_to_one_session() {
     let first_source = ButtonSource::Hidpp(HidppSessionId::with_epoch("mouse-a", 7));
     let second_source = ButtonSource::Hidpp(HidppSessionId::with_epoch("mouse-b", 3));
     let first = ActivePress {
+        chord: None,
         token: PressToken {
             id: PressId(1),
             key: PressKey::new(first_source.clone(), ButtonId::Back),
@@ -213,6 +217,7 @@ fn cancellation_is_scoped_to_one_session() {
         target: ActionDispatchTarget::Keyboard,
     };
     let second = ActivePress {
+        chord: None,
         token: PressToken {
             id: PressId(2),
             key: PressKey::new(second_source, ButtonId::Back),
@@ -233,6 +238,7 @@ fn hook_cancellation_leaves_hidpp_presses_active() {
     let mut state = ButtonState::default();
     let hook = hook_press(1, ButtonId::Back);
     let hidpp = ActivePress {
+        chord: None,
         token: PressToken {
             id: PressId(2),
             key: PressKey::new(
@@ -304,7 +310,7 @@ fn hook_actions_retain_the_press_time_target_across_focus_changes() {
     let input = owner.input();
     let target = ActionDispatchTarget::SafariProcess(417);
     let token = input
-        .try_hook_down_with_target(ButtonId::Back, None, target)
+        .try_hook_down_with_target(ButtonId::Back, None, None, target)
         .expect("Safari down should be queued");
     let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
         panic!("down should start the press lifecycle");
@@ -312,7 +318,12 @@ fn hook_actions_retain_the_press_time_target_across_focus_changes() {
     assert_eq!(started.target(), target);
 
     input
-        .try_hook_down_with_target(ButtonId::Forward, None, ActionDispatchTarget::Keyboard)
+        .try_hook_down_with_target(
+            ButtonId::Forward,
+            None,
+            None,
+            ActionDispatchTarget::Keyboard,
+        )
         .expect("post-focus-change down should be queued");
     assert!(matches!(
         recv_event(&received),
@@ -346,7 +357,7 @@ fn hidpp_edges_and_pulses_retain_their_press_time_targets() {
         let keyboard = ActionDispatchTarget::for_pointer(pointer, || None);
 
         input
-            .try_hidpp_down(&session, ButtonId::Back, None, safari)
+            .try_hidpp_down(&session, ButtonId::Back, None, None, safari)
             .expect("HID++ down should be queued");
         let ButtonRuntimeEvent::Started(started) = recv_event(&received) else {
             panic!("HID++ down should start a lifecycle");
@@ -393,12 +404,14 @@ fn pointer_change_cancels_old_target_but_preserves_keyboard_and_new_target() {
             .try_hook_down_with_target(
                 ButtonId::Back,
                 Some(&bound),
+                None,
                 ActionDispatchTarget::for_pointer(Some(old), || Some(417)),
             )
             .expect("old down");
         let new_press = input
             .try_hook_down_with_target(
                 ButtonId::Forward,
+                None,
                 None,
                 ActionDispatchTarget::for_pointer(Some(current), || {
                     panic!("identified target must not capture focus")
@@ -450,6 +463,7 @@ fn pointer_change_retargets_a_gesture_hold_instead_of_canceling_it() {
         .try_hook_down_with_target(
             ButtonId::GestureButton,
             None,
+            None,
             ActionDispatchTarget::for_pointer(Some(old), || None),
         )
         .expect("gesture down");
@@ -481,6 +495,7 @@ fn source_cancellation_invalidates_queued_gesture_work() {
         .try_hidpp_down(
             &session,
             ButtonId::Back,
+            None,
             None,
             ActionDispatchTarget::Keyboard,
         )
@@ -633,6 +648,7 @@ fn release_before_long_press_threshold_fires_only_the_short_action() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     };
     state.press(press.clone());
@@ -672,17 +688,18 @@ fn threshold_fires_long_once_and_suppresses_short_on_release() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     };
     state.press(press.clone());
     let mut events = Vec::new();
 
-    emit_due_long_presses(
+    emit_due_presses(
         &mut state,
         pressed_at + LONG_PRESS_THRESHOLD,
         &mut |event| events.push(event),
     );
-    emit_due_long_presses(
+    emit_due_presses(
         &mut state,
         pressed_at + LONG_PRESS_THRESHOLD + Duration::from_secs(1),
         &mut |event| events.push(event),
@@ -721,6 +738,7 @@ fn cancellation_never_fires_a_pending_short_or_long_action() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     };
     state.press(press);
@@ -731,7 +749,7 @@ fn cancellation_never_fires_a_pending_short_or_long_action() {
         CancelReason::Invalidated,
         &mut |event| events.push(event),
     );
-    emit_due_long_presses(
+    emit_due_presses(
         &mut state,
         pressed_at + LONG_PRESS_THRESHOLD,
         &mut |event| events.push(event),
@@ -832,6 +850,7 @@ fn the_worker_waits_only_for_the_earliest_pending_long_press_threshold() {
     let long_press_on = |id, button, at| ActivePress {
         token: PressToken::hook_for_test(id, button),
         behavior: PressBehavior::new(Some(&binding), at),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     };
     let mut state = ButtonState::default();
@@ -853,7 +872,7 @@ fn the_worker_waits_only_for_the_earliest_pending_long_press_threshold() {
     );
 
     let mut events = Vec::new();
-    emit_due_long_presses(
+    emit_due_presses(
         &mut state,
         pressed_at + LONG_PRESS_THRESHOLD,
         &mut |event| {
@@ -1004,6 +1023,7 @@ fn overdue_long_press_precedes_unrelated_queued_actions() {
     let press = ActivePress {
         token: PressToken::hook_for_test(1, ButtonId::Back),
         behavior: PressBehavior::new(Some(&binding), pressed_at),
+        chord: None,
         target: ActionDispatchTarget::Keyboard,
     };
     state.press(press.clone());
@@ -1027,7 +1047,7 @@ fn overdue_long_press_precedes_unrelated_queued_actions() {
     let mut generation = 0;
     let mut events = Vec::new();
 
-    assert!(!settle_due_long_presses(
+    assert!(!settle_due_presses(
         &queued,
         &shutdown,
         &shared_generation,
@@ -1066,6 +1086,7 @@ fn continuous_commands_cannot_starve_a_long_press_deadline() {
             input: ButtonInput::Down(ActivePress {
                 token: PressToken::hook_for_test(1, ButtonId::Back),
                 behavior: PressBehavior::new(Some(&binding), pressed_at),
+                chord: None,
                 target: ActionDispatchTarget::Keyboard,
             }),
         })

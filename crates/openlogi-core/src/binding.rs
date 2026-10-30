@@ -14,6 +14,7 @@ mod action_ring;
 mod application_target;
 mod button;
 mod category;
+mod chord;
 mod control;
 mod defaults;
 mod effect;
@@ -33,6 +34,7 @@ pub use action_ring::{
 pub use application_target::{ApplicationTarget, ApplicationTargetError};
 pub use button::{ButtonId, ParseButtonIdError};
 pub use category::Category;
+pub use chord::{ChordId, ParseChordIdError};
 pub use control::{Cid, KNOWN_CONTROLS, KnownControl, UNKNOWN_CONTROL_TRANSLATION_KEY};
 pub use defaults::{default_binding, default_binding_for, default_gesture_binding};
 pub use effect::{Effect, MediaKey, MouseButton, NativeAction, Script, Shortcut};
