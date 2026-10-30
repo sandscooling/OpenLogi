@@ -1,7 +1,8 @@
-use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, size};
+use gpui::{Entity, KeyDownEvent, Keystroke, Modifiers, TestAppContext, VisualTestContext, size};
 use openlogi_core::binding::default_binding;
 use openlogi_core::config::Config;
 
+use super::ShortcutError::{ShiftedSymbol, Unrecognized};
 use super::*;
 use crate::services::assets::AssetResolver;
 use crate::services::i18n::LOCALE_LOCK;
@@ -23,6 +24,28 @@ fn install_app_state(cx: &mut TestAppContext) {
 fn click_picker_control(cx: &mut VisualTestContext, selector: &'static str) {
     let bounds = cx.debug_bounds(selector).expect(selector);
     cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+}
+
+/// Press `key` with Cmd+Shift held, in the order GPUI's platforms report a
+/// shifted digit or symbol: a modifier change that holds Shift, then the
+/// shifted character without Shift (#2121).
+fn press_shifted_symbol(cx: &mut VisualTestContext, key: &str) {
+    let cmd = Modifiers {
+        platform: true,
+        ..Modifiers::default()
+    };
+    cx.simulate_modifiers_change(Modifiers { shift: true, ..cmd });
+    cx.simulate_event(KeyDownEvent {
+        keystroke: Keystroke {
+            modifiers: cmd,
+            key: key.into(),
+            key_char: None,
+        },
+        is_held: false,
+        prefer_character_input: false,
+    });
+    cx.simulate_modifiers_change(Modifiers::default());
     cx.update(|window, cx| window.draw(cx).clear(cx));
 }
 
@@ -102,7 +125,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
 
     click_picker_control(cx, "inspector-action-custom-shortcut-add");
     view.read_with(cx, |view, _| {
-        assert!(view.invalid_drafts.shortcut);
+        assert_eq!(view.invalid_drafts.shortcut, Some(Unrecognized));
         assert!(!view.invalid_drafts.application);
     });
     assert!(
@@ -113,7 +136,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     click_picker_control(cx, "inspector-action-custom-application-add");
     view.read_with(cx, |view, _| {
         assert!(view.action_picker_open());
-        assert!(view.invalid_drafts.shortcut);
+        assert_eq!(view.invalid_drafts.shortcut, Some(Unrecognized));
         assert!(view.invalid_drafts.application);
     });
     assert!(
@@ -126,7 +149,7 @@ fn action_picker_renders_after_opening_through_the_inspector(cx: &mut TestAppCon
     cx.simulate_input("Cmd+K");
     cx.update(|window, cx| window.draw(cx).clear(cx));
     view.read_with(cx, |view, _| {
-        assert!(!view.invalid_drafts.shortcut);
+        assert_eq!(view.invalid_drafts.shortcut, None);
         assert!(view.invalid_drafts.application);
     });
     assert!(
@@ -251,11 +274,23 @@ fn record_fills_the_custom_shortcut_from_the_next_key_press(cx: &mut TestAppCont
 
     click_picker_control(cx, "inspector-action-custom-shortcut-record");
     press(cx, "f21");
-    view.read_with(cx, |view, _| assert!(view.invalid_drafts.shortcut));
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.invalid_drafts.shortcut, Some(Unrecognized));
+    });
     assert!(
         cx.debug_bounds("inspector-action-custom-shortcut-error")
             .is_some()
     );
+
+    // #2121: Cmd+Shift+] arrives as Cmd+`}`. Record refuses it and leaves
+    // the field as it was.
+    click_picker_control(cx, "inspector-action-custom-shortcut-record");
+    press_shifted_symbol(cx, "}");
+    view.read_with(cx, |view, _| {
+        assert_eq!(view.invalid_drafts.shortcut, Some(ShiftedSymbol));
+        assert!(view.shortcut_recorder.is_none());
+    });
+    assert_eq!(shortcut_text(cx), "Ctrl+Shift+PageUp");
 
     // Moving focus out of the Record area ends the recording, so the next
     // key press reaches the newly focused field (#2138 review).
@@ -371,6 +406,8 @@ fn a_selected_gesture_can_render_in_the_binding_inspector(cx: &mut TestAppContex
                 chords: None,
                 chord_overrides: 0,
                 press_force: None,
+                extra_actions: &[],
+                hidden_actions: &[],
             },
             ActionPickerContext {
                 target: InspectorPicker::Action,
@@ -429,7 +466,7 @@ fn clearing_custom_action_drafts_resets_text_and_invalid_state(cx: &mut TestAppC
             view.custom_command_input
                 .update(cx, |input, cx| input.set_value("echo hi", window, cx));
             view.invalid_drafts = InvalidDrafts {
-                shortcut: true,
+                shortcut: Some(ShiftedSymbol),
                 application: true,
                 command: true,
             };
@@ -465,8 +502,9 @@ fn active_thumbwheel_directions_highlight_the_paired_control() {
 
 #[test]
 fn fallback_model_only_adds_thumbwheel_when_capability_is_measured() {
-    let (_, _, without, _) = scaled_model(None, 560., 420., false, LabelDistribution::LeftOnly);
-    let (_, _, with, _) = scaled_model(None, 560., 420., true, LabelDistribution::LeftOnly);
+    let (_, _, without, _) =
+        scaled_model(None, None, 560., 420., false, LabelDistribution::LeftOnly);
+    let (_, _, with, _) = scaled_model(None, None, 560., 420., true, LabelDistribution::LeftOnly);
     assert_eq!(
         without
             .iter()
@@ -727,6 +765,33 @@ fn a_gesture_button_without_raw_wheel_offers_no_wheel_hold(cx: &mut TestAppConte
     assert!(
         cx.debug_bounds("inspector-wheel-hold-row").is_none(),
         "no switch where holding cannot scroll"
+    );
+    drop(view);
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+/// An app profile replaces a gesture button's gestures with a button binding,
+/// which gets a release, so its picker offers the held actions too.
+#[gpui::test]
+fn an_inherited_gesture_button_offers_the_held_actions(cx: &mut TestAppContext) {
+    let _locale = LOCALE_LOCK.lock().unwrap();
+    rust_i18n::set_locale("en");
+    let mut config = Config::ephemeral();
+    config.set_gesture_mode(crate::state::tests::KNOWN_MOUSE_KEY, ButtonId::Back, true);
+    let (view, cx) = wheel_hold_view(cx, true, config, ButtonId::Back);
+    cx.update(|_, cx| {
+        AppState::apply(cx, |state| {
+            state.set_editing_app(Some("com.apple.Safari".into()))
+        });
+    });
+    view.update(cx, |view, _| view.picker = InspectorPicker::Action);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(cx.debug_bounds("inspector-gesture-override-Copy").is_some());
+    assert!(
+        cx.debug_bounds("inspector-gesture-override-DpiShift")
+            .is_some()
     );
     drop(view);
     cx.update(|window, _| window.remove_window());

@@ -47,9 +47,9 @@ pub use settings::LightSettings;
 pub use settings::{
     AppIcon, AppSettings, Appearance, AssetSourcePreference, CameraControls, ChordSettings,
     ChordWindow, ClickLock, ClickLockHold, DeviceViewMode, Lighting, MouseProfileTarget,
-    SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution, SmartShift,
-    ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity, WheelMode, chords_supported,
-    click_lock_supported,
+    OnboardMemory, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE,
+    ScrollResolution, SmartShift, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
+    WheelMode, chords_supported, click_lock_supported,
 };
 
 use crate::app::AppAliases;

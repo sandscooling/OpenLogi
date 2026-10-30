@@ -615,6 +615,19 @@ mod chords {
         assert!(state.config.devices[KNOWN_MOUSE_KEY].chords.is_empty());
     }
 
+    /// The layer is no profile: a chord row there would read the layer's label
+    /// as an application name and edit the chords of the Default profile.
+    #[test]
+    fn the_gshift_layer_edits_no_chords() {
+        let mut state = state_with_a_known_mouse();
+        let _ = state.commit_chord(id(), Action::Copy);
+        let _ = state.set_binding_layer(crate::state::BindingLayer::GShift);
+        assert!(state.chord_entries().is_none());
+
+        let _ = state.set_binding_layer(crate::state::BindingLayer::Normal);
+        assert_eq!(standing(&state), [(Action::Copy, ChordStanding::Default)]);
+    }
+
     #[test]
     fn nothing_in_an_app_needs_a_default_chord_to_turn_off() {
         let mut state = state_with_a_known_mouse();

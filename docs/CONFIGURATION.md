@@ -184,6 +184,17 @@ Common device fields are:
   `bindings`
 - `chords` and `per_app_chords`: two buttons pressed together run an action. See
   [Chords](#chords)
+- `gshift_bindings` for G-series mice: the G-Shift layer, one action per
+  button, for example `G7 = "Copy"`. While a button bound to `GShift` is held,
+  a button in this layer runs its layer action; a button the layer leaves out
+  keeps its normal binding
+- `onboard_memory` for G-series mice with HID++ `0x8100` onboard profiles:
+  `"off"` puts the mouse in host mode, where OpenLogi owns its buttons, DPI and
+  report rate. `{ profile = <n> }` selects onboard profile `<n>` (from 1), and
+  the mouse uses the buttons and DPI levels stored in that profile. When the
+  field is absent, the agent selects host mode only if a setting needs it: a
+  `report_rate`, a G-Shift binding, or a remapped button that the mouse
+  reports only in host mode. Otherwise the agent leaves the onboard mode alone
 - `action_ring`: default and complete per-application eight-slot layouts;
   `action_ring.per_app` takes the same selectors as `per_app_bindings`,
   including the Windows `exe:<filename>` fallback and `app:<alias>` keys
@@ -287,6 +298,8 @@ window_ms = 50
 - `per_app_chords` takes the same selectors as `per_app_bindings`. An entry
   replaces that chord in that application, adds one, or with `"None"` turns it
   off.
+- While a `GShift` button is held, a button in the `gshift_bindings` layer runs
+  its layer action and joins no chord.
 
 **Chord buttons change, even when pressed alone.** This applies only to a device
 with a chord, and only to its chord buttons:

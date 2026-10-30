@@ -13,19 +13,19 @@ use gpui_component::{
     input::{InputEvent, InputState},
     v_flex,
 };
-use openlogi_core::binding::{Action, ButtonId, ChordId, GestureDirection};
+use openlogi_core::binding::{Action, ButtonId, ChordId, GamingLayout, GestureDirection};
 use openlogi_core::config::ChordWindow;
 use openlogi_core::device::Capabilities;
 
 use super::force_sensing::{ForceSensingFacts, ForceSensingSlider, PressForce};
 use super::geometry::{
     LabelDistribution, asset_dimensions_for_png, asset_has_button_labels, asset_hotspots_for_png,
-    default_labels, labels_from_hotspots,
+    default_labels, fallback_hotspots, labels_from_hotspots, side_view_width,
 };
-use super::hotspots::{Hotspot, MOUSE_MODEL_SIZE, MouseControlId, default_hotspots};
+use super::hotspots::{Hotspot, MOUSE_MODEL_SIZE, MouseControlId};
 use super::inspector::{
     ActionPickerContext, BindingInspectorData, ChordData, InspectorPicker, InvalidDrafts,
-    ShortcutMode, binding_inspector, chord_controls,
+    ShortcutError, ShortcutMode, binding_inspector, chord_controls,
 };
 use super::leader_lines::{Geometry as LeaderGeometry, Label, paint as paint_leader_lines};
 use crate::app::{glow_canvas, keyboard_glow};
@@ -33,7 +33,7 @@ use crate::features::binding_editor::{Recording, RecordsShortcut, ShortcutRecord
 use crate::features::keyboard::editors::{PowerUserKind, text_editor_placeholder};
 use crate::features::profiles::{profile_canvas_status, profile_name};
 use crate::services::assets::{GlowGeometry, ResolvedAsset};
-use crate::state::{AppState, ChordEntry, DeviceKey, DeviceRecord, StateEvent};
+use crate::state::{AppState, BindingLayer, ChordEntry, DeviceKey, DeviceRecord, StateEvent};
 use crate::ui::theme::{self, ACCENT_BLUE};
 
 const SIDE_GAP: f32 = 24.;
@@ -44,6 +44,19 @@ const TWO_SIDED_LABEL_MIN_W: f32 = 700.;
 const CARD_EDGE_INSET: f32 = SIDE_GAP;
 
 const HOTSPOT_DOT: f32 = 12.;
+/// Left out for a device without an Actions Ring tab.
+const NO_ACTIONS_RING: &[Action] = &[Action::ShowActionsRing];
+
+/// The held actions, which only a button press can run.
+fn held_actions(offer_gshift: bool) -> &'static [Action] {
+    const ACTIONS: [Action; 2] = [Action::DpiShift, Action::GShift];
+    if offer_gshift {
+        &ACTIONS
+    } else {
+        &ACTIONS[..1]
+    }
+}
+
 /// Vertical space occupied by the device bar, profile context, and canvas
 /// padding. Normal operation no longer reserves a footer.
 const MODEL_VERTICAL_RESERVE: f32 = 154.;
@@ -66,6 +79,7 @@ const MODEL_MIN_CONTENT_W: f32 = 200.;
 
 struct MouseWorkspaceData<'a> {
     asset: Option<&'a ResolvedAsset>,
+    layout: Option<&'static GamingLayout>,
     active: Option<MouseControlId>,
     bindings: &'a BTreeMap<ButtonId, Action>,
     gesture_maps: &'a BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>>,
@@ -78,6 +92,10 @@ struct MouseWorkspaceData<'a> {
     chords: Option<Vec<ChordEntry>>,
     chord_overrides: usize,
     chord_window: ChordWindow,
+    /// Actions the picker offers beyond the catalog.
+    extra_actions: &'static [Action],
+    /// Catalog actions the picker leaves out.
+    hidden_actions: &'static [Action],
 }
 
 impl<'a> MouseWorkspaceData<'a> {
@@ -86,6 +104,7 @@ impl<'a> MouseWorkspaceData<'a> {
             asset: state
                 .current_record()
                 .and_then(|record| record.asset.as_ref()),
+            layout: state.current_button_layout(),
             active: state
                 .active_button()
                 .map(MouseControlId::from_active_button),
@@ -98,11 +117,27 @@ impl<'a> MouseWorkspaceData<'a> {
                 .current_record()
                 .and_then(|record| record.capabilities),
             wheel_hold: state.wheel_hold_buttons(),
-            editing_app: state.editing_app().map(|app| profile_name(state, app)),
+            editing_app: if state.binding_layer() == BindingLayer::GShift {
+                Some(tr!("actions.g_shift").to_string())
+            } else {
+                state.editing_app().map(|app| profile_name(state, app))
+            },
             overridden: state.editing_app_overrides(),
             chords: state.chord_entries(),
             chord_overrides: state.editing_app_chord_count(),
             chord_window: state.app_settings().chords.window_ms,
+            extra_actions: held_actions(
+                state.current_gaming_layout().is_some()
+                    && state.binding_layer() == BindingLayer::Normal,
+            ),
+            hidden_actions: if state
+                .current_record()
+                .is_none_or(crate::app::offers_actions_ring)
+            {
+                &[]
+            } else {
+                NO_ACTIONS_RING
+            },
         })
     }
 
@@ -113,6 +148,7 @@ impl<'a> MouseWorkspaceData<'a> {
         static NO_WHEEL_HOLD: BTreeSet<ButtonId> = BTreeSet::new();
         Self {
             asset: None,
+            layout: None,
             active: None,
             bindings: &NO_BINDINGS,
             gesture_maps: &NO_GESTURE_MAPS,
@@ -124,6 +160,8 @@ impl<'a> MouseWorkspaceData<'a> {
             chords: None,
             chord_overrides: 0,
             chord_window: ChordWindow::DEFAULT,
+            extra_actions: &[],
+            hidden_actions: &[],
         }
     }
 }
@@ -171,7 +209,7 @@ impl MouseModelView {
         });
         cx.subscribe(&custom_shortcut_input, |view, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::Change) {
-                view.invalid_drafts.shortcut = false;
+                view.invalid_drafts.shortcut = None;
                 cx.notify();
             }
         })
@@ -422,7 +460,8 @@ impl MouseModelView {
 
 impl RecordsShortcut for MouseModelView {
     /// A recorded chord fills the shortcut field, and Add commits it in the
-    /// chosen mode. A key a shortcut cannot send shows the field's error.
+    /// chosen mode. A key the recorder cannot turn into a chord shows the
+    /// field's error and leaves the field as it was.
     fn shortcut_recorded(
         &mut self,
         recording: Recording,
@@ -435,10 +474,15 @@ impl RecordsShortcut for MouseModelView {
                 self.custom_shortcut_input.update(cx, |input, cx| {
                     input.set_value(combo.rendered_label(), window, cx);
                 });
-                self.invalid_drafts.shortcut = false;
+                self.invalid_drafts.shortcut = None;
             }
             Recording::Cancelled => {}
-            Recording::Unsupported => self.invalid_drafts.shortcut = true,
+            Recording::Unsupported => {
+                self.invalid_drafts.shortcut = Some(ShortcutError::Unrecognized);
+            }
+            Recording::ShiftedSymbol => {
+                self.invalid_drafts.shortcut = Some(ShortcutError::ShiftedSymbol);
+            }
         }
         cx.notify();
     }
@@ -450,6 +494,7 @@ impl Render for MouseModelView {
         let force_sensing = self.sync_selection(window, cx);
         let MouseWorkspaceData {
             asset,
+            layout,
             active,
             bindings,
             gesture_maps,
@@ -461,6 +506,8 @@ impl Render for MouseModelView {
             chords,
             chord_overrides,
             chord_window,
+            extra_actions,
+            hidden_actions,
         } = MouseWorkspaceData::read(cx).unwrap_or_else(MouseWorkspaceData::empty);
 
         let gesture_buttons = labelled_gesture_buttons(gesture_maps, overridden);
@@ -475,7 +522,7 @@ impl Render for MouseModelView {
             mouse_h,
             hotspots,
             labels,
-        } = model_layout(asset, viewport_w, viewport_h, thumbwheel);
+        } = model_layout(asset, layout, viewport_w, viewport_h, thumbwheel);
         let canvas_h = mouse_h;
 
         let highlight = self.hovered.or(active).or(self.selected);
@@ -535,19 +582,30 @@ impl Render for MouseModelView {
                 wheel_hold,
                 editing_app: editing_app.as_deref(),
                 overridden,
-                chords: chords.as_deref().map(|entries| ChordData {
-                    entries,
-                    controls: &chord_controls,
-                    window: chord_window,
-                }),
+                chords: chord_data(chords.as_deref(), &chord_controls, chord_window),
                 chord_overrides,
                 press_force: PressForce::of(force_sensing.as_ref(), self.force_sensing.as_ref()),
+                extra_actions,
+                hidden_actions,
             },
             self.action_picker_context(&view),
             cx,
         );
         workspace_layout(canvas, profile_status, inspector, &self.focus_handle)
     }
+}
+
+/// The Chords section's facts, when the open profile has chords to edit.
+fn chord_data<'a>(
+    entries: Option<&'a [ChordEntry]>,
+    controls: &'a BTreeSet<ButtonId>,
+    window: ChordWindow,
+) -> Option<ChordData<'a>> {
+    Some(ChordData {
+        entries: entries?,
+        controls,
+        window,
+    })
 }
 
 /// The buttons whose labels read as gestures: every gesture-mode button, less
@@ -613,12 +671,14 @@ struct ModelLayout {
 /// drops the label gutter so it remains centred.
 fn model_layout(
     asset: Option<&ResolvedAsset>,
+    layout: Option<&GamingLayout>,
     viewport_w: f32,
     viewport_h: f32,
     thumbwheel: bool,
 ) -> ModelLayout {
     let target_h = (viewport_h - MODEL_VERTICAL_RESERVE).clamp(MODEL_MIN_H, MOUSE_MODEL_SIZE.1);
-    let has_labels = asset.is_none_or(asset_has_button_labels) && viewport_w >= 960.;
+    let has_labels =
+        asset.is_none_or(|asset| asset_has_button_labels(asset, layout)) && viewport_w >= 960.;
     let content_w =
         (viewport_w - MODEL_HORIZONTAL_RESERVE).clamp(MODEL_MIN_CONTENT_W, MODEL_CONTENT_MAX_W);
     let label_distribution = if has_labels && content_w >= TWO_SIDED_LABEL_MIN_W {
@@ -633,8 +693,14 @@ fn model_layout(
         0.
     };
     let max_image_w = (content_w - left_gutter - right_gutter).max(MODEL_MIN_CONTENT_W / 2.);
-    let (mouse_w, mouse_h, hotspots, mut labels) =
-        scaled_model(asset, target_h, max_image_w, thumbwheel, label_distribution);
+    let (mouse_w, mouse_h, hotspots, mut labels) = scaled_model(
+        asset,
+        layout,
+        target_h,
+        max_image_w,
+        thumbwheel,
+        label_distribution,
+    );
     if !has_labels {
         labels.clear();
     }
@@ -655,6 +721,7 @@ fn model_layout(
 /// `(mouse_w, mouse_h, hotspots, labels)`.
 fn scaled_model(
     asset: Option<&ResolvedAsset>,
+    layout: Option<&GamingLayout>,
     target_h: f32,
     max_w: f32,
     thumbwheel: bool,
@@ -662,12 +729,12 @@ fn scaled_model(
 ) -> (f32, f32, Vec<Hotspot>, Vec<Label>) {
     if let Some(a) = asset {
         let (w, h) = asset_dimensions_for_png(a, target_h, max_w);
-        let hotspots = asset_hotspots_for_png(a, w, h);
+        let hotspots = asset_hotspots_for_png(a, layout, w, h);
         let labels = labels_from_hotspots(&hotspots, h, label_distribution);
         (w, h, hotspots, labels)
     } else {
         let scale = (target_h / MOUSE_MODEL_SIZE.1).min(max_w / MOUSE_MODEL_SIZE.0);
-        let hotspots = default_hotspots(thumbwheel)
+        let hotspots = fallback_hotspots(layout, thumbwheel)
             .into_iter()
             .map(|hs| Hotspot {
                 x: hs.x * scale,
@@ -677,7 +744,7 @@ fn scaled_model(
                 ..hs
             })
             .collect();
-        let labels = default_labels(thumbwheel, label_distribution)
+        let labels = default_labels(layout, thumbwheel, label_distribution)
             .into_iter()
             .map(|l| Label {
                 y: l.y * scale,
@@ -729,10 +796,19 @@ fn breathing_art(
     glow: Option<(Arc<GlowGeometry>, Hsla)>,
 ) -> impl IntoElement {
     let device_art: AnyElement = match asset {
-        Some(a) => img(a.image_path.clone())
-            .w(px(mouse_w))
-            .h(px(mouse_h))
-            .into_any_element(),
+        Some(a) => {
+            let side_w = side_view_width(a, mouse_h);
+            h_flex()
+                .when_some(a.side_view.as_ref(), |this, side| {
+                    this.child(img(side.image_path.clone()).w(px(side_w)).h(px(mouse_h)))
+                })
+                .child(
+                    img(a.image_path.clone())
+                        .w(px(mouse_w - side_w))
+                        .h(px(mouse_h)),
+                )
+                .into_any_element()
+        }
         None => Silhouette {
             w: mouse_w,
             h: mouse_h,

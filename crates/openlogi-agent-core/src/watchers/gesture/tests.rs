@@ -997,14 +997,20 @@ async fn a_pointer_only_plan_refresh_keeps_a_held_gesture() {
     actions.shutdown();
 }
 
+/// A dispatcher over live action and scroll runtimes. The Actions Ring is the
+/// one action that reports over a channel instead of injecting input, so its
+/// receiver counts what runs.
 #[cfg(target_os = "linux")]
-#[tokio::test]
-async fn two_downs_from_one_report_fire_their_chord_once() {
-    use crate::runtime::ChordTable;
+fn chord_rig() -> (
+    crate::runtime::ActionRuntime,
+    crate::runtime::scroll::ScrollRuntime,
+    InputDispatcher,
+    mpsc::UnboundedReceiver<Option<String>>,
+) {
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
 
     let (_signal, device_io) = openlogi_hid::device_io_channel();
-    let (ring, mut ring_rx) = mpsc::unbounded_channel();
+    let (ring, ring_rx) = mpsc::unbounded_channel();
     let device_access = DeviceAccess {
         channel: CaptureChannelSlot::default(),
         registry: openlogi_hid::ChannelRegistry::default(),
@@ -1012,22 +1018,25 @@ async fn two_downs_from_one_report_fire_their_chord_once() {
         device_io,
         transport_turns: crate::hardware::TransportTurns::default(),
     };
-    let mut actions =
+    let actions =
         crate::runtime::ActionRuntime::new(Arc::default(), Arc::default(), device_access, ring)
             .unwrap();
-    let mut scroll = ScrollRuntime::spawn(Arc::new(ScrollPreferences::new(
+    let scroll = ScrollRuntime::spawn(Arc::new(ScrollPreferences::new(
         false,
         VerticalScrollSensitivity::default(),
     )))
     .unwrap();
-    let mut dispatcher = InputDispatcher::new(GestureOutputs::new(
+    let dispatcher = InputDispatcher::new(GestureOutputs::new(
         actions.dispatcher(),
         scroll.input(),
         Arc::default(),
     ));
+    (actions, scroll, dispatcher, ring_rx)
+}
 
-    // The Actions Ring is the one action that reports over a channel instead
-    // of injecting input, so it can be counted here.
+/// `chord` running the Actions Ring, with a window no test run outlasts.
+#[cfg(target_os = "linux")]
+fn ring_chord(chord: &str) -> crate::runtime::ChordTable {
     let mut config = openlogi_core::config::Config::default();
     config.app_settings.chords.window_ms = 150.into();
     config
@@ -1035,25 +1044,117 @@ async fn two_downs_from_one_report_fire_their_chord_once() {
         .entry("mouse".into())
         .or_default()
         .chords
-        .insert(
-            "Back+Forward".parse().expect("valid chord"),
-            Action::ShowActionsRing,
-        );
+        .insert(chord.parse().expect("valid chord"), Action::ShowActionsRing);
+    crate::runtime::ChordTable::for_device(&config, Some("mouse"), None)
+}
+
+#[cfg(target_os = "linux")]
+async fn ring_shown(ring_rx: &mut mpsc::UnboundedReceiver<Option<String>>) {
+    let shown = tokio::time::timeout(Duration::from_secs(1), ring_rx.recv())
+        .await
+        .expect("the ring is shown")
+        .expect("the ring channel stays open");
+    assert_eq!(shown.as_deref(), Some("mouse-a"));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn two_downs_from_one_report_fire_their_chord_once() {
+    let (mut actions, mut scroll, mut dispatcher, mut ring_rx) = chord_rig();
     let mut planned = plan();
     planned.dispatch.bindings.clear();
-    planned.dispatch.chords = ChordTable::for_device(&config, Some("mouse"), None);
+    planned.dispatch.chords = ring_chord("Back+Forward");
     let session = live_session_from_plan(7, planned);
     let id = session.id().clone();
     for button in [ButtonId::Back, ButtonId::Forward] {
         dispatcher.dispatch(&id, session.dispatch(), CapturedInput::ButtonDown(button));
     }
 
-    let shown = tokio::time::timeout(Duration::from_secs(1), ring_rx.recv())
-        .await
-        .expect("the chord fires")
-        .expect("the ring channel stays open");
-    assert_eq!(shown.as_deref(), Some("mouse-a"));
+    ring_shown(&mut ring_rx).await;
     actions.shutdown();
     assert!(ring_rx.try_recv().is_err(), "the chord fires once");
+    scroll.shutdown();
+}
+
+/// A gesture source with no raw XY reaches dispatch as a press and a release
+/// around its click, with no swipe. Alone it runs that click. With a chord
+/// partner the chord takes the press, and the click it still reports is
+/// dropped.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_click_only_gesture_source_clicks_alone_and_chords_with_a_partner() {
+    let (mut actions, mut scroll, mut dispatcher, mut ring_rx) = chord_rig();
+    let mut planned = plan();
+    planned.dispatch.bindings.clear();
+    planned.dispatch.gesture_bindings.insert(
+        ButtonId::GestureButton,
+        [(GestureDirection::Click, Action::ShowActionsRing)].into(),
+    );
+    planned.dispatch.chords = ring_chord("GestureButton+HapticPanel");
+    let session = live_session_from_plan(7, planned);
+    let id = session.id().clone();
+    let dispatch = session.dispatch();
+    let source = ButtonId::GestureButton;
+    let click = CapturedInput::Gesture(source, GestureDirection::Click);
+
+    dispatcher.dispatch(&id, dispatch, CapturedInput::ButtonDown(source));
+    dispatcher.dispatch(&id, dispatch, click);
+    dispatcher.dispatch(&id, dispatch, CapturedInput::ButtonUp(source));
+    ring_shown(&mut ring_rx).await;
+
+    dispatcher.dispatch(&id, dispatch, CapturedInput::ButtonDown(source));
+    dispatcher.dispatch(
+        &id,
+        dispatch,
+        CapturedInput::ButtonDown(ButtonId::HapticPanel),
+    );
+    ring_shown(&mut ring_rx).await;
+    dispatcher.dispatch(&id, dispatch, click);
+    dispatcher.dispatch(&id, dispatch, CapturedInput::ButtonUp(source));
+    dispatcher.dispatch(
+        &id,
+        dispatch,
+        CapturedInput::ButtonUp(ButtonId::HapticPanel),
+    );
+
+    actions.shutdown();
+    let extra: Vec<_> = std::iter::from_fn(|| ring_rx.try_recv().ok())
+        .flatten()
+        .collect();
+    assert_eq!(extra, Vec::<String>::new(), "the click is dropped");
+    scroll.shutdown();
+}
+
+/// While G-Shift is held, a button in the layer runs its layer action: its
+/// press opens no window, so a chord cannot take it. `Forward` is outside the
+/// layer and still opens one, which `Back` must not complete.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_press_in_the_held_gshift_layer_completes_no_chord() {
+    let (mut actions, mut scroll, mut dispatcher, mut ring_rx) = chord_rig();
+    let mut planned = plan();
+    planned.dispatch.bindings.clear();
+    planned
+        .dispatch
+        .bindings
+        .insert(ButtonId::G9, Binding::Single(Action::GShift));
+    planned
+        .dispatch
+        .shift_bindings
+        .insert(ButtonId::Back, Binding::Single(Action::None));
+    planned.dispatch.chords = ring_chord("Back+Forward");
+    let session = live_session_from_plan(7, planned);
+    let id = session.id().clone();
+    for button in [ButtonId::G9, ButtonId::Forward, ButtonId::Back] {
+        dispatcher.dispatch(&id, session.dispatch(), CapturedInput::ButtonDown(button));
+    }
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), ring_rx.recv())
+            .await
+            .is_err(),
+        "the layer owns the press"
+    );
+    actions.shutdown();
     scroll.shutdown();
 }

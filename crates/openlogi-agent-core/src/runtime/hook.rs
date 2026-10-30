@@ -7,7 +7,7 @@ mod click_lock;
 mod diverted;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
@@ -62,19 +62,47 @@ pub struct HookMaps {
     /// reported by the sessions themselves. Like the thumb-wheel polarities,
     /// these are hardware observations and survive map rebuilds.
     pub(crate) diverted_buttons: DivertedButtons,
+    /// The selected device's G-Shift bindings.
+    pub(crate) shift_bindings: BTreeMap<ButtonId, Binding>,
+    /// Devices with a G-Shift button held, set by HID++ capture. Survives map
+    /// rebuilds like the thumb-wheel polarity.
+    pub(crate) shift_held: BTreeSet<String>,
 }
 
 impl HookMaps {
+    /// The binding for `id` and whether it is a gesture button, honouring a
+    /// held G-Shift layer, which replaces gestures for the press.
+    fn press_binding(&self, id: ButtonId) -> (Option<Binding>, bool) {
+        if let Some(binding) = self.shift_binding(id) {
+            return (Some(binding.clone()), false);
+        }
+        (
+            self.bindings.get(&id).cloned(),
+            self.gestures.contains_key(&id),
+        )
+    }
+
+    /// `id`'s binding in a held G-Shift layer.
+    fn shift_binding(&self, id: ButtonId) -> Option<&Binding> {
+        let shifted = self
+            .selected_device
+            .as_ref()
+            .is_some_and(|device| self.shift_held.contains(device));
+        self.shift_bindings.get(&id).filter(|_| shifted)
+    }
+
     /// `id`'s place in a chord, for a press of it the hook sees. These maps run
     /// for every mouse the hook grabs, so once the selected device reports
     /// `id` over HID++, a press here came from another mouse, which waits for
-    /// no chord of the selected device's.
+    /// no chord of the selected device's. A press a held G-Shift layer resolves
+    /// runs its layer action, with no window a chord could take it from.
     fn chord_member(&self, id: ButtonId) -> Option<ChordMember> {
         let elsewhere = self
             .selected_device
             .as_deref()
             .is_some_and(|key| self.diverted_buttons.reports_over_hidpp(key, id));
-        self.chords.member(id).filter(|_| !elsewhere)
+        let layered = self.shift_binding(id).is_some();
+        self.chords.member(id).filter(|_| !elsewhere && !layered)
     }
 }
 
@@ -339,10 +367,11 @@ fn handle_button(
         hooks
             .try_read()
             .map_or((None, None, false, None, false), |maps| {
+                let (binding, is_gesture) = maps.press_binding(id);
                 (
-                    maps.bindings.get(&id).cloned(),
+                    binding,
                     maps.chord_member(id),
-                    maps.gestures.contains_key(&id),
+                    is_gesture,
                     maps.pointer_target,
                     device.is_some_and(|source| maps.diverted_buttons.owns(source, id)),
                 )
@@ -539,7 +568,7 @@ fn handle_key(
 
     info!(keycode, action = %action.label(), "key → executing bound action");
     let action_target = capture_target();
-    let queued = if action.held_chord().is_some() {
+    let queued = if action.is_held() {
         let queued = dispatcher.try_hook_key_down(keycode, &action, action_target);
         if queued {
             HELD_KEYS.with_borrow_mut(|keys| {
