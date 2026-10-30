@@ -1,8 +1,10 @@
 //! App-wide and per-device *value* settings: [`AppSettings`], [`Appearance`],
-//! [`UiScale`], [`AppIcon`], [`Lighting`], [`ScrollResolution`], [`WheelMode`] /
-//! [`SmartShift`], and the legacy [`GestureOwner`], plus their serde helpers.
+//! [`UiScale`], [`AppIcon`], [`ClickLock`], [`Lighting`], [`ScrollResolution`],
+//! [`WheelMode`] / [`SmartShift`], and the legacy [`GestureOwner`], plus their
+//! serde helpers.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use az::SaturatingAs;
 use nutype::nutype;
@@ -308,6 +310,139 @@ pub struct AppSettings {
     /// Logi Options+; off switches instantly. Only macOS reads it.
     #[serde(default = "default_true")]
     pub animate_desktop_switch: bool,
+    /// Hold the left button and release it to keep it held for a drag; the
+    /// next left click lets go. **Off by default**, and omitted from the file
+    /// until changed. It parses everywhere but only Linux acts on it (see
+    /// [`click_lock_supported`]). It works through the OS hook, so
+    /// [`Self::capture_mouse_events`] off also turns it off.
+    #[serde(default, skip_serializing_if = "ClickLock::is_default")]
+    pub click_lock: ClickLock,
+}
+
+/// Whether this platform can act on [`AppSettings::click_lock`].
+///
+/// The one owner of that answer, for the agent and the GUI alike. Linux can,
+/// because its hook grabs the mouse and a suppressed release simply leaves the
+/// virtual device's button down. Windows has its own ClickLock, and a macOS
+/// drag needs more than passing or suppressing edges.
+#[must_use]
+pub const fn click_lock_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
+/// The `[app_settings.click_lock]` table: hold the left button for
+/// [`Self::hold_ms`] and release it, and the button stays down so the mouse
+/// drags, until the next left click lets go.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClickLock {
+    /// Master switch. The hold time persists while off.
+    #[serde(default)]
+    pub enabled: bool,
+    /// How long the left button must be held for its release to lock it.
+    #[serde(default)]
+    pub hold_ms: ClickLockHold,
+}
+
+impl ClickLock {
+    /// `skip_serializing_if` helper: true when nothing diverges from the
+    /// default, so an untouched setting does not clutter `config.toml`.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// The hold time the OS hook should apply here, or `None` when click lock
+    /// is off or this platform does not support it.
+    #[must_use]
+    pub fn active_hold(self) -> Option<Duration> {
+        (click_lock_supported() && self.enabled).then(|| self.hold_ms.duration())
+    }
+}
+
+const CLICK_LOCK_HOLD_MIN_MS: u16 = 300;
+const CLICK_LOCK_HOLD_MAX_MS: u16 = 3000;
+const CLICK_LOCK_HOLD_DEFAULT_MS: u16 = 1000;
+
+/// Click lock's hold time in milliseconds, `300..=3000`.
+///
+/// Settings offers [`Self::STEP_MS`] steps; a hand-edited value between two of
+/// them is honoured as written.
+#[nutype(
+    const_fn,
+    validate(greater_or_equal = CLICK_LOCK_HOLD_MIN_MS, less_or_equal = CLICK_LOCK_HOLD_MAX_MS),
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        PartialOrd,
+        Ord,
+        TryFrom,
+        Into,
+        Display,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct ClickLockHold(u16);
+
+impl ClickLockHold {
+    /// Shortest selectable hold.
+    pub const MIN: Self = match Self::try_new(CLICK_LOCK_HOLD_MIN_MS) {
+        Ok(value) => value,
+        Err(_) => panic!("valid minimum click lock hold"),
+    };
+    /// Longest selectable hold.
+    pub const MAX: Self = match Self::try_new(CLICK_LOCK_HOLD_MAX_MS) {
+        Ok(value) => value,
+        Err(_) => panic!("valid maximum click lock hold"),
+    };
+    /// Out-of-the-box hold.
+    pub const DEFAULT: Self = match Self::try_new(CLICK_LOCK_HOLD_DEFAULT_MS) {
+        Ok(value) => value,
+        Err(_) => panic!("valid default click lock hold"),
+    };
+    /// The step between two holds Settings offers.
+    pub const STEP_MS: u16 = 100;
+
+    /// The nearest step to a floating-point slider value, inside the range.
+    #[must_use]
+    pub fn from_rounded(value: f32) -> Self {
+        let step = f32::from(Self::STEP_MS);
+        let (min, max) = (Self::MIN.into_inner(), Self::MAX.into_inner());
+        let stepped = if value.is_nan() {
+            f32::from(min)
+        } else {
+            (value / step).round() * step
+        };
+        let raw = stepped
+            .clamp(f32::from(min), f32::from(max))
+            .saturating_as::<u16>();
+        let Ok(value) = Self::try_new(raw) else {
+            unreachable!("clamped click lock hold is always valid");
+        };
+        value
+    }
+
+    /// The hold as a [`Duration`].
+    #[must_use]
+    pub fn duration(self) -> Duration {
+        Duration::from_millis(u64::from(self.into_inner()))
+    }
+}
+
+impl Default for ClickLockHold {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+impl From<ClickLockHold> for f32 {
+    fn from(hold: ClickLockHold) -> Self {
+        Self::from(hold.into_inner())
+    }
 }
 
 const SENSITIVITY_MIN: u8 = 1;
@@ -514,6 +649,7 @@ impl Default for AppSettings {
             low_battery_notifications: true,
             lock_key_notifications: true,
             animate_desktop_switch: true,
+            click_lock: ClickLock::default(),
         }
     }
 }
@@ -850,6 +986,40 @@ mod tests {
                 .tunable_torque,
             None
         );
+    }
+
+    #[test]
+    fn a_floating_click_lock_hold_snaps_to_a_step_inside_the_range() {
+        let hold = |raw: u16| ClickLockHold::try_new(raw).expect("valid hold");
+        for (raw, expected) in [
+            (1049.0, 1000),
+            (1050.0, 1100),
+            (299.0, 300),
+            (3001.0, 3000),
+            (f32::NAN, 300),
+            (f32::NEG_INFINITY, 300),
+            (f32::INFINITY, 3000),
+        ] {
+            assert_eq!(ClickLockHold::from_rounded(raw), hold(expected), "{raw}");
+        }
+    }
+
+    #[test]
+    fn the_hold_applies_only_while_enabled_on_a_supported_platform() {
+        let hold = ClickLockHold::try_new(2500).expect("valid hold");
+        let on = ClickLock {
+            enabled: true,
+            hold_ms: hold,
+        };
+        assert_eq!(
+            on.active_hold(),
+            click_lock_supported().then_some(Duration::from_millis(2500))
+        );
+        let off = ClickLock {
+            enabled: false,
+            hold_ms: hold,
+        };
+        assert_eq!(off.active_hold(), None);
     }
 
     #[test]

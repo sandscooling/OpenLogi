@@ -6,8 +6,8 @@ use super::{AppState, StateEvent};
 use crate::platform::app_icon::AppIconExt as _;
 use gpui_component::ThemeMode;
 use openlogi_core::config::{
-    AppIcon, AppSettings, Appearance, AssetSourcePreference, DeviceViewMode, MouseProfileTarget,
-    ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
+    AppIcon, AppSettings, Appearance, AssetSourcePreference, ClickLockHold, DeviceViewMode,
+    MouseProfileTarget, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
 };
 use openlogi_core::update_feed::UpdateChannel;
 
@@ -313,6 +313,40 @@ impl AppState {
         self.config
             .edit(|config| config.app_settings.smooth_scroll = enabled);
         self.persist_and_reload("smooth scroll");
+        StateEvent::SettingsChanged.into()
+    }
+    /// Whether the agent's input hook, which click lock runs in, could be
+    /// doing its job. Only a connected agent reporting no hook says otherwise:
+    /// `capture_mouse_events = false` takes the hook and click lock with it.
+    #[must_use]
+    pub fn click_lock_can_run(&self) -> bool {
+        self.agent_status()
+            .is_none_or(|status| status.hook_installed)
+    }
+    /// Toggle click lock and persist it. The agent publishes the change to its
+    /// input hook on config reload, and a button locked at that moment still
+    /// lets go on its next click. An already-set value writes nothing and is
+    /// still reported; disk failures restore the persisted value.
+    pub fn commit_click_lock(&mut self, enabled: bool) -> StateEvents {
+        if self.config.app_settings.click_lock.enabled == enabled {
+            return StateEvent::SettingsChanged.into();
+        }
+        self.config
+            .edit(|config| config.app_settings.click_lock.enabled = enabled);
+        self.persist_and_reload("click lock");
+        StateEvent::SettingsChanged.into()
+    }
+    /// Set click lock's hold time and persist it. The agent publishes the
+    /// value to its input hook on config reload, for the next press. An
+    /// already-set value writes nothing and is still reported; disk failures
+    /// restore the persisted value.
+    pub fn commit_click_lock_hold(&mut self, hold: ClickLockHold) -> StateEvents {
+        if self.config.app_settings.click_lock.hold_ms == hold {
+            return StateEvent::SettingsChanged.into();
+        }
+        self.config
+            .edit(|config| config.app_settings.click_lock.hold_ms = hold);
+        self.persist_and_reload("click lock hold time");
         StateEvent::SettingsChanged.into()
     }
     /// Toggle the overlay's low-battery notices and persist it. The agent

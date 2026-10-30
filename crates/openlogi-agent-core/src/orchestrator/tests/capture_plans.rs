@@ -1,5 +1,9 @@
 //! What a config reload or an app switch publishes to the hook and the capture managers.
 
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use openlogi_core::config::ClickLockHold;
 use openlogi_core::device_order::PhysicalDeviceKey;
 use openlogi_hid::reprog_controls::BACK_CIDS;
 
@@ -437,6 +441,55 @@ fn hook_maps_publish_selection_and_preserve_learned_thumbwheel_polarity() {
     let maps = orch.shared.hook_maps.read().expect("hook maps");
     assert_eq!(maps.selected_device.as_deref(), Some("a"));
     assert_eq!(maps.thumbwheel_positive_is_forward.get("a"), Some(&true));
+}
+
+#[test]
+fn click_lock_reaches_the_hook_from_the_config_and_follows_a_reload() {
+    let hold = |orch: &Orchestrator| orch.shared.hook_maps.read().expect("maps").click_lock;
+    let mut orch = orchestrator(Config::default());
+    orch.devices = vec![dev("a", 1, true)];
+    orch.rebuild();
+    assert_eq!(hold(&orch), None, "off by default");
+
+    let mut config = Config::default();
+    config.app_settings.click_lock.enabled = true;
+    config.app_settings.click_lock.hold_ms = ClickLockHold::try_new(1500).expect("valid hold");
+    orch.reload_config(config.clone());
+    assert_eq!(
+        hold(&orch),
+        cfg!(target_os = "linux").then_some(Duration::from_millis(1500)),
+        "only Linux acts on the setting"
+    );
+
+    // The setting is global. Disabling the selected device, which may not even
+    // be a mouse, empties its maps but says nothing about any other mouse.
+    config.set_device_enabled("a", false);
+    orch.reload_config(config);
+    let maps = orch.shared.hook_maps.read().expect("maps");
+    assert!(
+        maps.bindings.is_empty(),
+        "the disabled device stays unmapped"
+    );
+    assert_eq!(
+        maps.click_lock,
+        cfg!(target_os = "linux").then_some(Duration::from_millis(1500))
+    );
+}
+
+/// Each resume bumps the epoch once, whatever else the resume coalesces with.
+#[test]
+fn a_system_resume_advances_the_wake_epoch() {
+    let mut orch = orchestrator(Config::default());
+    let epoch = orch.shared.wake_epoch.clone();
+    assert_eq!(epoch.load(Ordering::Relaxed), 0);
+    orch.reapply_after_system_resume();
+    assert_eq!(epoch.load(Ordering::Relaxed), 1);
+    orch.reapply_reconnected_on_next_refresh();
+    assert_eq!(
+        epoch.load(Ordering::Relaxed),
+        1,
+        "a device reconnecting is not a suspend"
+    );
 }
 
 fn assert_side_gesture_capture_follows_platform_ownership_and_hook_availability(button: ButtonId) {

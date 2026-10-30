@@ -68,6 +68,34 @@ fn v9_without_disabled_keys_loads_and_a_save_stamps_v10() {
 }
 
 #[test]
+fn v10_without_click_lock_loads_and_a_save_stamps_v11() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "schema_version = 10\n[app_settings]\nsmooth_scroll = true\n",
+    )
+    .expect("write v10 config");
+
+    let (mut config, mut file) = ConfigFile::load_from_path(&path).expect("load v10 config");
+    assert_eq!(config.schema_version, SCHEMA_VERSION);
+    assert_eq!(config.app_settings.click_lock, ClickLock::default());
+
+    config.app_settings.click_lock.enabled = true;
+    file.save(&config).expect("save v11 config");
+
+    let saved = fs::read_to_string(&path).expect("read saved config");
+    assert!(saved.starts_with("schema_version = 11\n"), "saved: {saved}");
+    assert!(
+        saved.contains("[app_settings.click_lock]"),
+        "saved: {saved}"
+    );
+    let reloaded = Config::load_from_path(&path).expect("reload v11 config");
+    assert!(reloaded.app_settings.click_lock.enabled);
+    assert!(reloaded.app_settings.smooth_scroll);
+}
+
+#[test]
 fn schema_version_zero_is_rejected() {
     let temp = tempfile::tempdir().expect("tempdir");
     let path = temp.path().join("config.toml");
@@ -110,6 +138,16 @@ capabilities = { buttons = true, pointer = true, lighting = false, scroll_invers
 
     fs::write(
         &path,
+        "schema_version = 11\n[app_settings.click_lock]\nhold = 1000\n",
+    )
+    .expect("write click lock typo");
+    assert_matches!(
+        Config::load_from_path(&path).expect_err("click lock typo must fail"),
+        ConfigError::Parse { .. }
+    );
+
+    fs::write(
+        &path,
         "schema_version = 6\n[devices.mouse]\ngesture_owner = \"Off\"\n",
     )
     .expect("write obsolete field");
@@ -128,6 +166,10 @@ fn persisted_numeric_contracts_reject_unsafe_values() {
         "schema_version = 6\n[app_settings]\nvertical_scroll_sensitivity = 0\n",
         "schema_version = 6\n[app_settings]\nvertical_scroll_sensitivity = 101\n",
         "schema_version = 6\n[app_settings]\nvertical_scroll_sensitivity = -2147483648\n",
+        "schema_version = 11\n[app_settings.click_lock]\nhold_ms = 299\n",
+        "schema_version = 11\n[app_settings.click_lock]\nhold_ms = 3001\n",
+        "schema_version = 11\n[app_settings.click_lock]\nhold_ms = -1\n",
+        "schema_version = 11\n[app_settings.click_lock]\nhold_ms = 65536\n",
         "schema_version = 6\n[devices.mouse]\nthumbwheel_sensitivity = -1\n",
         "schema_version = 6\n[devices.mouse]\ndpi = 65536\n",
         "schema_version = 6\n[devices.mouse]\ndpi_presets = [800, 70000]\n",

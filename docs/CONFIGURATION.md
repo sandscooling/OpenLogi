@@ -41,10 +41,12 @@ profiles so they keep their native direction. v9 adds the `[apps]` alias table;
 v8 files load unchanged.
 v10 adds the per-device `disabled_keys` policy. Older readers reject a v10
 header before parsing its fields. A v9 file without the policy still loads.
+v11 adds the `[app_settings.click_lock]` table. A v10 file without it loads with
+click lock off, and is stamped v11 by its next save.
 
 ## Shape
 
-`schema_version` is required and currently `10`. `selected_device` is an
+`schema_version` is required and currently `11`. `selected_device` is an
 optional physical device key.
 
 `[app_settings]` contains application-wide preferences:
@@ -61,6 +63,14 @@ optional physical device key.
 - `vertical_scroll_sensitivity`, from `1` through `100` (`14` is 1×);
   continuous trackpad input remains native
 - `thumbwheel_sensitivity`, from `1` through `100` (`14` is 1×)
+- `[app_settings.click_lock]`: hold the left button and release it, and the
+  button stays down so the mouse drags; the next left click lets go. `enabled`
+  defaults to `false`. `hold_ms` is how long the button must be held, from `300`
+  through `3000` (default `1000`; Settings offers 100 ms steps). Any hold that
+  long locks on release, so a slow drag or a long text selection does too. It
+  needs `capture_mouse_events`, and applies to every Logitech mouse the hook
+  grabs, whichever device is selected. The table parses everywhere but only
+  Linux acts on it; macOS and Windows ignore it
 - `mouse_profile_target`: `pointer` (default, including existing configs that
   omit this preference) or `focused`. Mouse button profiles follow the window
   under the pointer; the desktop uses the global bindings. Keyboard profiles

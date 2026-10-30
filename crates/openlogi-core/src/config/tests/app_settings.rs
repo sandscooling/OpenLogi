@@ -84,6 +84,54 @@ fn app_settings_vertical_scroll_sensitivity_defaults_and_roundtrips() {
 }
 
 #[test]
+fn app_settings_click_lock_is_opt_in_and_omitted_until_changed() {
+    let default: Config = toml::from_str("schema_version = 10").expect("parse defaults");
+    assert_eq!(default.app_settings.click_lock, ClickLock::default());
+    assert!(!default.app_settings.click_lock.enabled);
+    assert_eq!(
+        default.app_settings.click_lock.hold_ms,
+        ClickLockHold::DEFAULT
+    );
+
+    // Another setting writes the `[app_settings]` table; click lock stays out.
+    let mut cfg = Config::default();
+    cfg.app_settings.smooth_scroll = true;
+    let body = toml::to_string_pretty(&cfg).expect("serialize");
+    assert!(!body.contains("click_lock"), "omitted: {body}");
+}
+
+#[test]
+fn app_settings_click_lock_roundtrips_with_either_field_alone() {
+    let mut cfg = Config::default();
+    cfg.app_settings.click_lock = ClickLock {
+        enabled: true,
+        hold_ms: ClickLockHold::try_new(2300).expect("valid hold"),
+    };
+    assert_eq!(
+        write_and_read(&cfg).app_settings.click_lock,
+        cfg.app_settings.click_lock
+    );
+
+    // The hold outlives the switch, so turning it back on restores it.
+    cfg.app_settings.click_lock.enabled = false;
+    assert_eq!(
+        write_and_read(&cfg).app_settings.click_lock.hold_ms,
+        ClickLockHold::try_new(2300).expect("valid hold")
+    );
+
+    let enabled_only: Config =
+        toml::from_str("schema_version = 11\n[app_settings.click_lock]\nenabled = true\n")
+            .expect("parse enabled alone");
+    assert_eq!(
+        enabled_only.app_settings.click_lock,
+        ClickLock {
+            enabled: true,
+            hold_ms: ClickLockHold::DEFAULT
+        }
+    );
+}
+
+#[test]
 fn app_settings_ui_scale_roundtrips() {
     let mut cfg = Config::default();
     cfg.app_settings.ui_scale = UiScale::ExtraLarge;

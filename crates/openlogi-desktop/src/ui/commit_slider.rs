@@ -12,7 +12,7 @@ use std::rc::Rc;
 
 use gpui::{App, AppContext as _, Context, Entity, Subscription, Window};
 use gpui_component::slider::{SliderEvent, SliderState};
-use openlogi_core::config::{ThumbwheelSensitivity, VerticalScrollSensitivity};
+use openlogi_core::config::{ClickLockHold, ThumbwheelSensitivity, VerticalScrollSensitivity};
 use openlogi_core::hid::{Dpi, PointerSpeed, SmartShiftThreshold, TunableTorque};
 
 /// A value a slider thumb can rest on.
@@ -100,6 +100,7 @@ macro_rules! rounded_slider_unit {
 }
 
 rounded_slider_unit!(
+    ClickLockHold,
     Dpi,
     SmartShiftThreshold,
     ThumbwheelSensitivity,

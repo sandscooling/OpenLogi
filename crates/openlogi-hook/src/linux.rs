@@ -477,6 +477,18 @@ impl LowResCompanions {
     }
 }
 
+/// Whether `event` is evdev's autorepeat (value 2) of the left button.
+///
+/// A held button means nothing new, but [`translate`] reads any non-zero value
+/// as a press, and on the left button click lock would take a second press of
+/// a held button for the click that ends a lock. No other event is touched.
+fn is_left_autorepeat(event: &InputEvent) -> bool {
+    matches!(
+        event.destructure(),
+        EventSummary::Key(_, KeyCode::BTN_LEFT, 2)
+    )
+}
+
 /// Run one event past the callback and return what to forward to the desktop
 /// for it, if anything. Held low-res companions never get here.
 ///
@@ -494,6 +506,9 @@ fn dispatch(
     source: &EventDevice,
     cb: &dyn Fn(HookEvent) -> EventDisposition,
 ) -> Option<InputEvent> {
+    if is_left_autorepeat(&event) {
+        return None;
+    }
     let delivery = translate(&event, hires_scroll)
         .map(|mut mouse| {
             if let MouseEvent::Button { device, .. } = &mut mouse {
@@ -1112,6 +1127,42 @@ mod tests {
         let device = seen.into_inner().expect("the button names its source");
         assert_eq!(device, source);
         assert!(crate::source_is_remappable(Some(&device)));
+    }
+
+    /// Value 2 of the left button is dropped before the callback, which would
+    /// read it as a second press, and before the desktop.
+    #[test]
+    fn a_left_autorepeat_reaches_nothing() {
+        let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.0, 2);
+        let forwarded = dispatch(event, false, false, &EventDevice::default(), &|_| {
+            panic!("the callback must not see an autorepeat")
+        });
+        assert!(forwarded.is_none());
+    }
+
+    /// Only left loses its repeat, as in the script click lock replaces. Every
+    /// other button still reaches the callback and the desktop as it did.
+    #[test]
+    fn another_buttons_autorepeat_is_untouched() {
+        let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_MIDDLE.0, 2);
+        let seen = std::cell::Cell::new(false);
+        let forwarded = dispatch(event, false, false, &EventDevice::default(), &|_| {
+            seen.set(true);
+            EventDisposition::PassThrough
+        });
+        assert!(seen.get(), "the callback sees it");
+        assert_eq!(forwarded.map(|event| event.value()), Some(2));
+    }
+
+    /// A key that is no mouse button is forwarded as it came, without troubling
+    /// the callback.
+    #[test]
+    fn another_keys_autorepeat_is_forwarded() {
+        let event = InputEvent::new(EventType::KEY.0, KeyCode::KEY_A.0, 2);
+        let forwarded = dispatch(event, false, false, &EventDevice::default(), &|_| {
+            panic!("the callback must not see a key it has no button for")
+        });
+        assert_eq!(forwarded.map(|event| event.value()), Some(2));
     }
 }
 

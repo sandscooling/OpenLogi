@@ -34,7 +34,8 @@ pub(super) use gpui_component::{
 pub(super) use gpui_updater::{UpdateStatus, Updater};
 pub(super) use openlogi_core::brand::{HELP_URL, RELEASES_URL, REPO_URL};
 pub(super) use openlogi_core::config::{
-    Appearance, AssetSourcePreference, ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity,
+    Appearance, AssetSourcePreference, ClickLockHold, ThumbwheelSensitivity, UiScale,
+    VerticalScrollSensitivity,
 };
 
 pub(super) use crate::app::menu::{CloseWindow, Minimize, Zoom};
@@ -124,6 +125,7 @@ pub struct SettingsView {
     asset_source_select: Entity<SelectState<Vec<assets::AssetSourceOption>>>,
     thumbwheel_sensitivity: CommitSlider<ThumbwheelSensitivity>,
     vertical_scroll_sensitivity: CommitSlider<VerticalScrollSensitivity>,
+    click_lock_hold: CommitSlider<ClickLockHold>,
     /// Shared app-wide updater, surfaced on the Updates page. A launch-time
     /// check result is already visible when the window opens.
     updater: Entity<Updater>,
@@ -219,6 +221,7 @@ impl SettingsView {
 
         let thumbwheel_sensitivity = Self::thumbwheel_sensitivity_slider(cx);
         let vertical_scroll_sensitivity = Self::vertical_scroll_sensitivity_slider(cx);
+        let click_lock_hold = Self::click_lock_hold_slider(cx);
 
         // Poll the agent's live event monitor while this window is open. The task
         // is held in the view, so closing Settings drops it, polling stops, and
@@ -262,6 +265,7 @@ impl SettingsView {
             asset_source_select,
             thumbwheel_sensitivity,
             vertical_scroll_sensitivity,
+            click_lock_hold,
             updater,
             updater_obs,
             copied: false,
@@ -325,6 +329,22 @@ impl SettingsView {
                 AppState::apply(cx, |state| {
                     state.commit_vertical_scroll_sensitivity(sensitivity)
                 });
+            },
+        )
+    }
+
+    /// The click-lock hold slider, committed once it is released.
+    fn click_lock_hold_slider(cx: &mut Context<Self>) -> CommitSlider<ClickLockHold> {
+        let current = AppState::try_read(cx).map_or(ClickLockHold::DEFAULT, |state| {
+            state.app_settings().click_lock.hold_ms
+        });
+        CommitSlider::new(
+            SliderRange::new(ClickLockHold::MIN, ClickLockHold::MAX)
+                .step(f32::from(ClickLockHold::STEP_MS)),
+            current,
+            cx,
+            |_, hold, cx| {
+                AppState::apply(cx, |state| state.commit_click_lock_hold(hold));
             },
         )
     }
@@ -420,14 +440,32 @@ impl Render for SettingsView {
         // these independently owned sliders so neither can keep presenting the
         // rejected value after that rollback.
         if let Some(settings) = AppState::try_read(cx).map(AppState::app_settings) {
-            let (vertical_scroll, thumbwheel) = (
+            let (vertical_scroll, thumbwheel, hold) = (
                 settings.vertical_scroll_sensitivity,
                 settings.thumbwheel_sensitivity,
+                settings.click_lock.hold_ms,
             );
             self.vertical_scroll_sensitivity
                 .sync(vertical_scroll, window, cx);
             self.thumbwheel_sensitivity.sync(thumbwheel, window, cx);
+            self.click_lock_hold.sync(hold, window, cx);
         }
+        let click_lock = AppState::try_read(cx).map_or(
+            general::ClickLockRows {
+                enabled: false,
+                can_run: true,
+                hold: ClickLockHold::DEFAULT,
+                hold_slider: self.click_lock_hold.slider().clone(),
+            },
+            |state| general::ClickLockRows {
+                enabled: state.app_settings().click_lock.enabled,
+                can_run: state.click_lock_can_run(),
+                hold: self
+                    .click_lock_hold
+                    .shown(state.app_settings().click_lock.hold_ms),
+                hold_slider: self.click_lock_hold.slider().clone(),
+            },
+        );
         let pal = theme::palette(cx);
         let view = cx.entity();
         // Only surface the Camera permission when a webcam is actually present,
@@ -452,6 +490,7 @@ impl Render for SettingsView {
                     vertical_scroll: self.vertical_scroll_sensitivity.slider().clone(),
                     thumbwheel: self.thumbwheel_sensitivity.slider().clone(),
                 },
+                click_lock,
                 self.registration_status,
             ))
             .page(updates::updates_page(self.updater.clone()));

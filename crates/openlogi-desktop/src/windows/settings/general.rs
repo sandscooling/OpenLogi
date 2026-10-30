@@ -1,14 +1,16 @@
 //! General settings page.
 
 use super::{
-    App, AppState, Entity, FluentBuilder, IconName, InteractiveElement, ParentElement,
-    SettingField, SettingGroup, SettingItem, SettingPage, Slider, SliderState, Styled,
-    ThumbwheelSensitivity, VerticalScrollSensitivity, div, h_flex, px, theme, v_flex,
+    App, AppState, ClickLockHold, Disableable, Entity, FluentBuilder, IconName, InteractiveElement,
+    ParentElement, SettingField, SettingGroup, SettingItem, SettingPage, Sizable, Slider,
+    SliderState, Styled, ThumbwheelSensitivity, VerticalScrollSensitivity, div, h_flex, px, theme,
+    v_flex,
 };
 use crate::ui::theme::Typography as _;
 use gpui_base::Button as BaseButton;
 use gpui_component::radio::{Radio, RadioGroup};
-use openlogi_core::config::MouseProfileTarget;
+use gpui_component::switch::Switch;
+use openlogi_core::config::{MouseProfileTarget, click_lock_supported};
 
 use crate::platform::registration::ServiceStatus;
 
@@ -19,16 +21,29 @@ pub(super) struct SensitivitySliders {
     pub(super) thumbwheel: Entity<SliderState>,
 }
 
+/// What the click-lock rows show, resolved by the view that owns the slider.
+pub(super) struct ClickLockRows {
+    pub(super) enabled: bool,
+    /// Whether the agent's input hook could be running it. Without one the
+    /// rows say so instead of offering a switch that does nothing.
+    pub(super) can_run: bool,
+    /// The hold to show: the one under a dragged thumb, else the committed one.
+    pub(super) hold: ClickLockHold,
+    pub(super) hold_slider: Entity<SliderState>,
+}
+
 pub(super) fn general_page(
     sliders: SensitivitySliders,
+    click_lock: ClickLockRows,
     registration_status: ServiceStatus,
 ) -> SettingPage {
     let SensitivitySliders {
         vertical_scroll,
         thumbwheel,
     } = sliders;
-    let group = SettingGroup::new()
-        .item(mouse_profile_target_item())
+    let group = SettingGroup::new().item(mouse_profile_target_item());
+    let group = click_lock_items(group, click_lock);
+    let group = group
         .item(smooth_scrolling_item())
         .item(
             SettingItem::new(
@@ -135,6 +150,73 @@ fn mouse_profile_target_item() -> SettingItem {
     .description(tr!("pointer.mouse_profile_target_description"))
 }
 
+/// The click-lock rows, on the platforms that can act on the setting. The hold
+/// time only means something while click lock is on, so it shows only then.
+fn click_lock_items(group: SettingGroup, rows: ClickLockRows) -> SettingGroup {
+    if !click_lock_supported() {
+        return group;
+    }
+    let ClickLockRows {
+        enabled,
+        can_run,
+        hold,
+        hold_slider,
+    } = rows;
+    let group = group.item(click_lock_item(enabled, can_run));
+    if enabled {
+        group.item(click_lock_hold_item(hold_slider, hold, can_run))
+    } else {
+        group
+    }
+}
+
+/// The click-lock switch. `SettingField::switch` has no handle on its control,
+/// so this renders the same `Switch` under a selector of its own.
+fn click_lock_item(enabled: bool, can_run: bool) -> SettingItem {
+    SettingItem::new(
+        tr!("pointer.click_lock"),
+        SettingField::render(move |options, _, _| {
+            div().debug_selector(|| "click-lock-switch".into()).child(
+                Switch::new("click-lock")
+                    .checked(enabled)
+                    .disabled(options.is_disabled())
+                    .with_size(options.size())
+                    .on_click(|enabled: &bool, _, cx: &mut App| {
+                        AppState::apply(cx, |state| state.commit_click_lock(*enabled));
+                    }),
+            )
+        }),
+    )
+    .disabled(!can_run)
+    .description(if can_run {
+        tr!("pointer.click_lock_description")
+    } else {
+        tr!("pointer.click_lock_unavailable")
+    })
+}
+
+/// The click-lock hold-time slider.
+fn click_lock_hold_item(
+    slider: Entity<SliderState>,
+    hold: ClickLockHold,
+    can_run: bool,
+) -> SettingItem {
+    SettingItem::new(
+        tr!("pointer.click_lock_hold"),
+        SettingField::render(move |options, _, cx| {
+            let bar = Slider::new(&slider).disabled(options.is_disabled());
+            // Seconds, because the value column has no room for "3000 ms" beside
+            // a long caption.
+            let seconds = format!("{:.1}", hold.duration().as_secs_f32());
+            let value = tr!("pointer.click_lock_hold_value", seconds => seconds);
+            slider_field(bar, value.to_string(), hold == ClickLockHold::DEFAULT, cx)
+                .debug_selector(|| "click-lock-hold".into())
+        }),
+    )
+    .disabled(!can_run)
+    .description(tr!("pointer.click_lock_hold_description"))
+}
+
 /// The smooth-scrolling switch.
 fn smooth_scrolling_item() -> SettingItem {
     SettingItem::new(
@@ -199,8 +281,8 @@ fn lock_key_notifications_item() -> SettingItem {
 
 fn thumbwheel_sensitivity_field(slider: &Entity<SliderState>, cx: &mut App) -> gpui::Div {
     let value = ThumbwheelSensitivity::from_rounded(slider.read(cx).value().start());
-    sensitivity_field(
-        slider,
+    slider_field(
+        Slider::new(slider),
         value.to_string(),
         value == ThumbwheelSensitivity::DEFAULT,
         cx,
@@ -209,20 +291,15 @@ fn thumbwheel_sensitivity_field(slider: &Entity<SliderState>, cx: &mut App) -> g
 
 fn vertical_scroll_sensitivity_field(slider: &Entity<SliderState>, cx: &mut App) -> gpui::Div {
     let value = VerticalScrollSensitivity::from_rounded(slider.read(cx).value().start());
-    sensitivity_field(
-        slider,
+    slider_field(
+        Slider::new(slider),
         value.to_string(),
         value == VerticalScrollSensitivity::DEFAULT,
         cx,
     )
 }
 
-fn sensitivity_field(
-    slider: &Entity<SliderState>,
-    value: String,
-    is_default: bool,
-    cx: &mut App,
-) -> gpui::Div {
+fn slider_field(slider: Slider, value: String, is_default: bool, cx: &mut App) -> gpui::Div {
     let pal = theme::palette(cx);
     v_flex()
         .flex_shrink_0()
@@ -231,7 +308,7 @@ fn sensitivity_field(
             h_flex()
                 .items_center()
                 .gap_3()
-                .child(div().w(px(180.)).child(Slider::new(slider)))
+                .child(div().w(px(180.)).child(slider))
                 .child(
                     div()
                         .w(px(72.))
@@ -310,6 +387,175 @@ mod tests {
         AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, point, size,
     };
     use openlogi_core::config::{Config, UiScale};
+
+    /// Open Settings on a real window, over the given config and a read-only
+    /// or writable save path.
+    fn settings_window(
+        cx: &mut TestAppContext,
+        config: Config,
+        read_only: bool,
+    ) -> VisualTestContext {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            theme::register_builtin_themes(cx);
+        });
+        let handle = cx.update(|cx| {
+            let (commands, _) = tokio::sync::mpsc::unbounded_channel();
+            let resolver = AssetResolver::new();
+            let mut sources = Sources::in_memory(config, &resolver, commands);
+            if read_only {
+                sources.persistence = ConfigPersistence::ReadOnly("read-only test".into());
+            }
+            AppState::set_global(cx.new(|_| AppState::new(sources)), cx);
+            settings::open(cx);
+            cx.global::<WindowRegistry>().settings.unwrap()
+        });
+        let mut visual = VisualTestContext::from_window(handle.into(), cx);
+        visual.simulate_resize(size(px(920.), px(640.)));
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        visual
+    }
+
+    #[cfg(target_os = "linux")]
+    fn click_at(visual: &mut VisualTestContext, selector: &'static str) {
+        let bounds = visual
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} renders"));
+        visual.simulate_click(bounds.center(), Modifiers::default());
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn click_lock(visual: &mut VisualTestContext) -> openlogi_core::config::ClickLock {
+        visual.update(|_, cx| AppState::try_read(cx).unwrap().app_settings().click_lock)
+    }
+
+    /// The agent reports its status, with or without an input hook.
+    #[cfg(target_os = "linux")]
+    fn set_hook_installed(visual: &mut VisualTestContext, hook_installed: bool) {
+        use crate::state::AgentLink;
+        visual.update(|window, cx| {
+            AppState::apply(cx, |state| {
+                state.set_agent_link(AgentLink::Ready(openlogi_ipc::AgentStatus {
+                    accessibility_granted: true,
+                    hook_installed,
+                    launch_at_login: false,
+                    inventory: openlogi_ipc::InventoryHealth::Ready,
+                    protocol_version: openlogi_ipc::PROTOCOL_VERSION,
+                    agent_version: "click-lock-test".to_string(),
+                    input_monitoring_granted: true,
+                    hid_open_failures: false,
+                    secure_input: openlogi_ipc::SecureInput::Off,
+                    virtual_keyboard: openlogi_ipc::VirtualKeyboardStatus::Unsupported,
+                }))
+            });
+            window.draw(cx).clear(cx);
+        });
+    }
+
+    /// Greek carries the longest caption: it must wrap, not push the switch
+    /// out of the window.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn the_click_lock_switch_turns_the_setting_on_and_off(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("el");
+        let mut visual = settings_window(cx, Config::ephemeral(), false);
+        let viewport = Bounds::new(point(px(0.), px(0.)), size(px(920.), px(640.)));
+        let switch = visual.debug_bounds("click-lock-switch").unwrap();
+        assert!(viewport.contains(&switch.origin) && viewport.contains(&switch.bottom_right()));
+
+        assert!(!click_lock(&mut visual).enabled);
+        assert!(
+            visual.debug_bounds("click-lock-hold").is_none(),
+            "the hold means nothing while click lock is off"
+        );
+
+        click_at(&mut visual, "click-lock-switch");
+        assert!(click_lock(&mut visual).enabled);
+        assert!(visual.debug_bounds("click-lock-hold").is_some());
+
+        click_at(&mut visual, "click-lock-switch");
+        assert!(!click_lock(&mut visual).enabled);
+        assert!(visual.debug_bounds("click-lock-hold").is_none());
+        rust_i18n::set_locale("en");
+    }
+
+    /// The row keeps the save's verdict: a refused write leaves the setting
+    /// off, and the switch showing what is actually stored.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn a_failed_save_leaves_click_lock_off(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut visual = settings_window(cx, Config::ephemeral(), true);
+        click_at(&mut visual, "click-lock-switch");
+        assert!(!click_lock(&mut visual).enabled);
+    }
+
+    /// A click on the bar commits one hold, on a step, inside the range. The
+    /// page does not touch the switch, and the thumb follows the save.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn the_hold_slider_commits_a_step_on_release(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut config = Config::ephemeral();
+        config.app_settings.click_lock.enabled = true;
+        let mut visual = settings_window(cx, config, false);
+        assert_eq!(click_lock(&mut visual).hold_ms, ClickLockHold::DEFAULT);
+
+        click_at(&mut visual, "click-lock-hold");
+        let lock = click_lock(&mut visual);
+        assert!(lock.enabled);
+        assert_ne!(lock.hold_ms, ClickLockHold::DEFAULT);
+        assert!(lock.hold_ms > ClickLockHold::MIN && lock.hold_ms < ClickLockHold::MAX);
+        assert_eq!(
+            u16::from(lock.hold_ms) % ClickLockHold::STEP_MS,
+            0,
+            "{}",
+            lock.hold_ms
+        );
+    }
+
+    /// No hook, no click lock: with `capture_mouse_events` off the rows must
+    /// not offer a switch that does nothing, and a live hook brings them back.
+    #[cfg(target_os = "linux")]
+    #[gpui::test]
+    fn the_click_lock_rows_refuse_input_without_a_hook(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut config = Config::ephemeral();
+        config.app_settings.click_lock.enabled = true;
+        let mut visual = settings_window(cx, config, false);
+
+        set_hook_installed(&mut visual, false);
+        click_at(&mut visual, "click-lock-switch");
+        assert!(click_lock(&mut visual).enabled, "the switch is disabled");
+        click_at(&mut visual, "click-lock-hold");
+        assert_eq!(
+            click_lock(&mut visual).hold_ms,
+            ClickLockHold::DEFAULT,
+            "the slider is disabled"
+        );
+
+        set_hook_installed(&mut visual, true);
+        click_at(&mut visual, "click-lock-switch");
+        assert!(!click_lock(&mut visual).enabled);
+    }
+
+    /// Everywhere else the field only parses, so no row claims otherwise.
+    #[cfg(not(target_os = "linux"))]
+    #[gpui::test]
+    fn no_other_platform_shows_click_lock(cx: &mut TestAppContext) {
+        let _locale = LOCALE_LOCK.lock().unwrap();
+        rust_i18n::set_locale("en");
+        let mut config = Config::ephemeral();
+        config.app_settings.click_lock.enabled = true;
+        let mut visual = settings_window(cx, config, false);
+        assert!(visual.debug_bounds("click-lock-switch").is_none());
+        assert!(visual.debug_bounds("click-lock-hold").is_none());
+    }
 
     #[gpui::test]
     fn mouse_profile_target_choices_update_state_and_respect_failed_saves(cx: &mut TestAppContext) {

@@ -1,5 +1,5 @@
 # OpenLogi configuration example. Copy only the sections you need.
-schema_version = 10
+schema_version = 11
 selected_device = "receiver:aabbccdd:slot:1"
 
 [app_settings]
@@ -24,6 +24,12 @@ app_icon = "openlogi"
 # macOS only: Previous / Next Desktop slide like a three-finger swipe (default
 # true); false switches at once.
 animate_desktop_switch = true
+
+# Linux only: hold left for hold_ms (300 to 3000) and release it, and the button
+# stays down so the mouse drags; the next left click lets go.
+[app_settings.click_lock]
+enabled = false
+hold_ms = 1000
 
 [devices."receiver:aabbccdd:slot:1"]
 custom_name = "Office mouse"

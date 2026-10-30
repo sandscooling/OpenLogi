@@ -3,10 +3,12 @@
 //! Installs the platform hook lazily, reads atomically published button maps,
 //! and converts callback-thread mouse/key input into the shared action runtime.
 
+mod click_lock;
 mod diverted;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -16,6 +18,7 @@ use openlogi_core::binding::{
     Action, Binding, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
 };
 use openlogi_core::config::KeyTrigger;
+use openlogi_hid::DeviceIoGate;
 use openlogi_hook::{
     EventDevice, EventDisposition, Hook, HookEvent, KeyEvent, MouseEvent, source_is_remappable,
 };
@@ -24,6 +27,7 @@ use tracing::{info, warn};
 use super::scroll::ScrollInputHandle;
 use super::{ActionDispatchTarget, ActionDispatcher, PressToken};
 use crate::event_monitor::SharedEventMonitor;
+use click_lock::ClickLock;
 pub(crate) use diverted::DivertedButtons;
 
 /// The button maps and selected-device thumb-wheel polarity the OS-hook callback
@@ -46,6 +50,9 @@ pub struct HookMaps {
         expect(dead_code, reason = "read only by the Windows native-wheel fallback")
     )]
     pub(crate) selected_device: Option<String>,
+    /// Click lock's hold time, or `None` while it is off. Read only by a left
+    /// press that could start a lock.
+    pub(crate) click_lock: Option<Duration>,
     /// Per-device `0x2150 default_dir`, learned by HID++ capture sessions:
     /// `true` means a positive native horizontal delta is physical forward/up.
     /// Entries survive map rebuilds because they are hardware observations,
@@ -179,6 +186,11 @@ thread_local! {
     /// Thread-local rather than a shared `Mutex` keeps the hot path lock-free and
     /// free of cross-thread contention on the freeze-sensitive callback.
     static HOLD: RefCell<HoldState> = RefCell::new(HoldState::default());
+    /// Click lock's state, on the same one-per-mouse footing as [`HOLD`]: a
+    /// lock on one mouse is not released by a click on another. A device
+    /// thread that ends takes its state with it, and the kernel releases the
+    /// button when that thread's virtual device closes.
+    static CLICK_LOCK: RefCell<ClickLock> = RefCell::new(ClickLock::default());
     /// Accepted non-gesture presses retain their edge disposition even when
     /// moving the pointer changes the binding before physical release.
     static SUPPRESSED_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
@@ -247,17 +259,65 @@ fn try_queue_action(
     }
 }
 
-/// Remap path for Middle/Back/Forward. Must stay lock-light and non-blocking.
+/// Advance `wake_epoch` as each suspend is announced, until the gate's producer
+/// is dropped.
+///
+/// The resume count alone comes too late. logind reports a resume only after
+/// the `system-sleep` hooks have run, while the mouse is live from the thaw, so
+/// a click in between (the one that woke the machine, say) would meet a lock
+/// that still looks live and be swallowed as its unlock. Counting the suspend
+/// stales the lock before the sleep. If the suspend then fails and the button
+/// is still down, its next click passes and lets go all the same.
+pub async fn count_suspends(mut gate: DeviceIoGate, wake_epoch: Arc<AtomicU64>) {
+    while let Some(allowed) = gate.changed().await {
+        if !allowed {
+            wake_epoch.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// One left-button edge through click lock, which is all the OS hook ever does
+/// to that button. `wake_epoch` is the current system-sleep count.
+fn handle_left_button(
+    pressed: bool,
+    hooks: &SharedHookMaps,
+    wake_epoch: &AtomicU64,
+) -> EventDisposition {
+    let now = Instant::now();
+    let wake_epoch = wake_epoch.load(Ordering::Relaxed);
+    CLICK_LOCK.with_borrow_mut(|lock| {
+        if pressed {
+            // `try_read` only, like the remap path below. Failing to read is
+            // the same as click lock being off, and a press always passes.
+            lock.press(now, wake_epoch, || {
+                hooks.try_read().ok().and_then(|maps| maps.click_lock)
+            })
+        } else {
+            lock.release(now, wake_epoch)
+        }
+    })
+}
+
+/// Remap path for Middle/Back/Forward, and click lock for Left. Must stay
+/// lock-light and non-blocking.
 fn handle_button(
     id: ButtonId,
     pressed: bool,
     device: Option<&EventDevice>,
     hooks: &SharedHookMaps,
+    wake_epoch: &AtomicU64,
     dispatcher: &ActionDispatcher,
     capture_safari_pid: impl FnOnce() -> Option<i32>,
 ) -> EventDisposition {
-    // Primary L/R always pass through (suppressing them would brick the mouse).
-    if !id.is_os_hook_button() || !button_source_may_remap(device) {
+    if !button_source_may_remap(device) {
+        return EventDisposition::PassThrough;
+    }
+    if id == ButtonId::LeftClick {
+        return handle_left_button(pressed, hooks, wake_epoch);
+    }
+    // Everything else outside the remap set passes through: taking over the
+    // right button would brick the mouse just as the left one would.
+    if !id.is_os_hook_button() {
         return EventDisposition::PassThrough;
     }
     // `try_read` only: a blocking read on the tap thread freezes every pointer
@@ -483,6 +543,7 @@ pub fn start(
     dispatcher: ActionDispatcher,
     scroll: ScrollInputHandle,
     monitor: SharedEventMonitor,
+    wake_epoch: Arc<AtomicU64>,
 ) -> Option<Hook> {
     if !Hook::has_accessibility() {
         warn!(
@@ -510,6 +571,7 @@ pub fn start(
                     pressed,
                     device.as_ref(),
                     &hooks,
+                    &wake_epoch,
                     &dispatcher,
                     openlogi_hook::frontmost_safari_pid,
                 ),

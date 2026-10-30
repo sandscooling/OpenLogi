@@ -133,6 +133,12 @@ pub struct SharedHandles {
     /// Live smooth-scroll and vertical sensitivity settings read without
     /// taking the orchestrator/config lock.
     pub scroll_preferences: Arc<ScrollPreferences>,
+    /// Counts system sleeps for the OS-hook callback, on the suspend (see
+    /// [`count_suspends`](crate::runtime::hook::count_suspends)) and again on
+    /// the resume, which is all a clock-gap wake reports. The kernel releases
+    /// held keys at suspend, so a click lock from an older epoch holds nothing.
+    /// An atomic because a locked button must not depend on the maps' lock.
+    pub wake_epoch: Arc<AtomicU64>,
     pub dpi_cycle: Arc<RwLock<DpiCycles>>,
     /// Capture plans for online enabled devices, plus the latest route of
     /// every online physical device. A disabled device stays out of the plans
@@ -653,6 +659,7 @@ impl Orchestrator {
                 config.app_settings.smooth_scroll,
                 config.app_settings.vertical_scroll_sensitivity,
             )),
+            wake_epoch: Arc::new(AtomicU64::new(0)),
             dpi_cycle: Arc::new(RwLock::new(DpiCycles::default())),
             capture_plans,
             capture_channel: Arc::new(RwLock::new(None)),
@@ -756,11 +763,16 @@ impl Orchestrator {
     /// so they're built together here and published under one lock — keeping
     /// `rebuild` and `set_current_app` from drifting into a half-populated write.
     fn hook_maps_for(&self, key: Option<&str>) -> HookMaps {
+        let click_lock = self.config.app_settings.click_lock.active_hold();
         // A disabled selected device gets empty maps: the OS hook then passes
         // its events through untouched instead of applying remaps to a device
-        // the user asked OpenLogi to leave alone.
+        // the user asked OpenLogi to leave alone. Click lock stays: it belongs
+        // to no device, and the selection may not even be a mouse.
         if key.is_some_and(|k| !self.config.device_enabled(k)) {
-            return HookMaps::default();
+            return HookMaps {
+                click_lock,
+                ..HookMaps::default()
+            };
         }
         let (app, pointer_target) = self.mouse_context();
         let mut bindings = button_bindings_for(&self.config, key, app);
@@ -785,6 +797,7 @@ impl Orchestrator {
             gestures,
             pointer_target,
             selected_device: key.map(str::to_owned),
+            click_lock,
             ..HookMaps::default()
         }
     }
@@ -1350,6 +1363,7 @@ impl Orchestrator {
     /// Devices may have lost volatile diversion even when the snapshot looks
     /// identical; retain this intent until an authoritative refresh arrives.
     pub fn reapply_after_system_resume(&mut self) {
+        self.shared.wake_epoch.fetch_add(1, Ordering::Relaxed);
         self.forced_capture_rearm = true;
         self.reapply_volatile_on_next_refresh();
     }

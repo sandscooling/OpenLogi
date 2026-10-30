@@ -4,6 +4,9 @@ use super::*;
 use openlogi_core::binding::{GESTURE_SWIPE_THRESHOLD, LongPressBinding};
 use openlogi_core::config::KeyModifiers;
 
+/// A wake epoch for tests that never see a system resume.
+static NO_WAKE: AtomicU64 = AtomicU64::new(0);
+
 fn token(id: u64, button: ButtonId) -> PressToken {
     PressToken::hook_for_test(id, button)
 }
@@ -259,6 +262,7 @@ fn mouse_press_uses_the_target_published_with_its_binding_not_frontmost_safari()
             true,
             Some(&mouse),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || { panic!("pointer-scoped binding must not capture foreground Safari") }
         ),
@@ -290,6 +294,7 @@ fn mouse_press_uses_the_target_published_with_its_binding_not_frontmost_safari()
             false,
             Some(&mouse),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || { panic!("release does not retarget") }
         ),
@@ -309,6 +314,7 @@ fn mouse_press_uses_the_target_published_with_its_binding_not_frontmost_safari()
             true,
             Some(&mouse),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || None
         ),
@@ -325,6 +331,7 @@ fn mouse_press_uses_the_target_published_with_its_binding_not_frontmost_safari()
             false,
             Some(&mouse),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || { panic!("release does not retarget") }
         ),
@@ -364,6 +371,7 @@ fn queued_unidentified_pointer_action_retains_its_press_time_target() {
                 true,
                 Some(&mouse),
                 &hooks,
+                &NO_WAKE,
                 &dispatcher,
                 || focused_safari.get(),
             ),
@@ -403,6 +411,7 @@ fn queued_unidentified_pointer_action_retains_its_press_time_target() {
                 false,
                 Some(&mouse),
                 &hooks,
+                &NO_WAKE,
                 &dispatcher,
                 || panic!("release does not retarget"),
             ),
@@ -451,9 +460,15 @@ fn safari_target_never_relaxes_device_isolation() {
         for id in [ButtonId::Back, ButtonId::Forward] {
             for pressed in [true, false] {
                 assert_eq!(
-                    handle_button(id, pressed, source.as_ref(), &hooks, &dispatcher, || {
-                        Some(417)
-                    }),
+                    handle_button(
+                        id,
+                        pressed,
+                        source.as_ref(),
+                        &hooks,
+                        &NO_WAKE,
+                        &dispatcher,
+                        || { Some(417) }
+                    ),
                     EventDisposition::PassThrough
                 );
             }
@@ -681,6 +696,7 @@ fn an_echo_of_a_hidpp_diverted_press_is_dropped_on_both_edges() {
                 pressed,
                 Some(&m650),
                 &hooks,
+                &NO_WAKE,
                 &dispatcher,
                 || None
             ),
@@ -703,6 +719,7 @@ fn an_echo_of_a_hidpp_diverted_press_is_dropped_on_both_edges() {
             true,
             Some(&other_mouse),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || None
         ),
@@ -720,6 +737,7 @@ fn an_echo_of_a_hidpp_diverted_press_is_dropped_on_both_edges() {
             false,
             Some(&other_mouse),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || None
         ),
@@ -752,6 +770,7 @@ fn an_echoed_press_keeps_its_release_after_the_session_ends() {
             true,
             Some(&m650),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || None
         ),
@@ -768,6 +787,7 @@ fn an_echoed_press_keeps_its_release_after_the_session_ends() {
             false,
             Some(&m650),
             &hooks,
+            &NO_WAKE,
             &dispatcher,
             || None
         ),
@@ -778,4 +798,278 @@ fn an_echoed_press_keeps_its_release_after_the_session_ends() {
         "neither edge reached the button runtime"
     );
     assert!(owner.shutdown());
+}
+
+/// What a test mouse's left button does through [`handle_button`], with a
+/// fresh click-lock state. The tests own their hold: zero always locks, and
+/// [`FOREVER`] never does.
+struct LeftButton {
+    hooks: SharedHookMaps,
+    wake_epoch: AtomicU64,
+    dispatcher: ActionDispatcher,
+    owner: super::super::button::ButtonRuntimeOwner,
+    events: mpsc::Receiver<super::super::button::ButtonRuntimeEvent>,
+}
+
+const FOREVER: Duration = Duration::from_secs(3600);
+
+impl LeftButton {
+    fn with_hold(hold: Option<Duration>) -> Self {
+        CLICK_LOCK.with_borrow_mut(|lock| *lock = ClickLock::default());
+        let (dispatcher, owner, events) = test_dispatcher();
+        Self {
+            hooks: Arc::new(RwLock::new(HookMaps {
+                click_lock: hold,
+                ..HookMaps::default()
+            })),
+            wake_epoch: AtomicU64::new(0),
+            dispatcher,
+            owner,
+            events,
+        }
+    }
+
+    fn edge(&self, id: ButtonId, pressed: bool) -> EventDisposition {
+        let mouse = EventDevice {
+            vendor_id: Some(0x046d),
+            product_name: Some("Logitech MX Master 3".into()),
+            ..EventDevice::default()
+        };
+        handle_button(
+            id,
+            pressed,
+            Some(&mouse),
+            &self.hooks,
+            &self.wake_epoch,
+            &self.dispatcher,
+            || panic!("click lock never targets an application"),
+        )
+    }
+
+    fn press(&self) -> EventDisposition {
+        self.edge(ButtonId::LeftClick, true)
+    }
+
+    fn release(&self) -> EventDisposition {
+        self.edge(ButtonId::LeftClick, false)
+    }
+
+    /// Hold left past a zero hold and release: the button is now locked.
+    fn lock(&self) {
+        assert_eq!(self.press(), EventDisposition::PassThrough);
+        assert_eq!(self.release(), EventDisposition::Suppress);
+    }
+
+    fn set_hold(&self, hold: Option<Duration>) {
+        self.hooks.write().expect("maps").click_lock = hold;
+    }
+
+    /// Stop the worker and prove the left button gave it nothing to do: its
+    /// channel closes without a single event.
+    fn assert_nothing_queued(mut self) {
+        assert!(self.owner.shutdown());
+        assert_eq!(
+            self.events.try_recv().err(),
+            Some(mpsc::TryRecvError::Disconnected),
+            "the button runtime must never see the left button"
+        );
+    }
+}
+
+#[test]
+fn left_passes_and_queues_nothing_with_click_lock_off() {
+    let left = LeftButton::with_hold(None);
+    for _ in 0..3 {
+        assert_eq!(left.press(), EventDisposition::PassThrough);
+        assert_eq!(left.release(), EventDisposition::PassThrough);
+    }
+    left.assert_nothing_queued();
+}
+
+#[test]
+fn a_full_lock_cycle_holds_one_release_and_one_press_back() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    left.lock();
+    assert_eq!(left.press(), EventDisposition::Suppress, "unlocking press");
+    assert_eq!(
+        left.release(),
+        EventDisposition::PassThrough,
+        "ends the drag"
+    );
+    left.lock();
+    assert_eq!(left.press(), EventDisposition::Suppress);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+#[test]
+fn a_click_shorter_than_the_hold_passes_both_edges() {
+    let left = LeftButton::with_hold(Some(FOREVER));
+    assert_eq!(left.press(), EventDisposition::PassThrough);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+/// A left binding is a config-schema fact the hook has never honoured, and
+/// click lock must not start: it is not a binding and meets none.
+#[test]
+fn a_binding_on_left_does_not_change_click_lock() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    left.hooks
+        .write()
+        .expect("maps")
+        .bindings
+        .insert(ButtonId::LeftClick, Action::Copy.into());
+    left.lock();
+    assert_eq!(left.press(), EventDisposition::Suppress);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+#[test]
+fn right_is_unaffected_before_during_and_after_a_lock() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    let right = |pressed| left.edge(ButtonId::RightClick, pressed);
+    assert_eq!(right(true), EventDisposition::PassThrough);
+    assert_eq!(right(false), EventDisposition::PassThrough);
+    left.lock();
+    assert_eq!(right(true), EventDisposition::PassThrough);
+    assert_eq!(right(false), EventDisposition::PassThrough);
+    // Right neither unlocked nor disturbed the lock.
+    assert_eq!(left.press(), EventDisposition::Suppress);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+/// A source the hook may not touch keeps its native left button, whatever the
+/// setting says: the trackpad on macOS's global tap, in practice.
+#[test]
+fn a_source_that_may_not_be_remapped_never_locks() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    let trackpad = EventDevice {
+        product_name: Some("Apple Internal Keyboard / Trackpad".into()),
+        ..EventDevice::default()
+    };
+    for pressed in [true, false, true, false] {
+        assert_eq!(
+            handle_button(
+                ButtonId::LeftClick,
+                pressed,
+                Some(&trackpad),
+                &left.hooks,
+                &left.wake_epoch,
+                &left.dispatcher,
+                || None,
+            ),
+            EventDisposition::PassThrough
+        );
+    }
+    left.assert_nothing_queued();
+}
+
+/// A held write lock is a contended `try_read`. Idle fails open, so the press
+/// that could not read the hold does not lock on release; Locked needs no read
+/// at all, so a rebuild in flight cannot strand a held button.
+#[test]
+fn a_contended_config_lock_fails_open_and_still_unlocks() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    {
+        let _rebuild = left.hooks.write().expect("maps");
+        assert_eq!(left.press(), EventDisposition::PassThrough);
+        assert_eq!(left.release(), EventDisposition::PassThrough);
+    }
+
+    left.lock();
+    {
+        let _rebuild = left.hooks.write().expect("maps");
+        assert_eq!(left.press(), EventDisposition::Suppress);
+        assert_eq!(left.release(), EventDisposition::PassThrough);
+    }
+    left.assert_nothing_queued();
+}
+
+#[test]
+fn disabling_while_locked_still_lets_the_next_click_release() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    left.lock();
+    left.set_hold(None);
+    assert_eq!(left.press(), EventDisposition::Suppress);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    // And it is off from then on.
+    assert_eq!(left.press(), EventDisposition::PassThrough);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+#[test]
+fn a_hold_is_read_at_the_press_so_a_mid_press_change_waits_for_the_next() {
+    let left = LeftButton::with_hold(Some(FOREVER));
+    assert_eq!(left.press(), EventDisposition::PassThrough);
+    left.set_hold(Some(Duration::ZERO));
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.lock();
+}
+
+/// The kernel dropped the held button at suspend, so nothing is held any more
+/// and the first click after wake is an ordinary one, not a swallowed press.
+#[test]
+fn a_stale_wake_epoch_makes_the_first_click_after_wake_ordinary() {
+    let left = LeftButton::with_hold(Some(FOREVER));
+    left.set_hold(Some(Duration::ZERO));
+    left.lock();
+    left.set_hold(Some(FOREVER));
+    left.wake_epoch.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(left.press(), EventDisposition::PassThrough);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+/// A resume only speaks for what was locked before it.
+#[test]
+fn a_lock_taken_after_a_wake_still_unlocks_normally() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    left.wake_epoch.fetch_add(1, Ordering::Relaxed);
+    left.lock();
+    assert_eq!(left.press(), EventDisposition::Suppress);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+/// The kernel released the button at suspend with the press still down, and the
+/// mouse's release is only read after the wake. Nothing is held any more, so
+/// holding that release back would lock nothing and swallow the next click.
+#[test]
+fn a_press_held_across_a_wake_does_not_lock() {
+    let left = LeftButton::with_hold(Some(Duration::ZERO));
+    assert_eq!(left.press(), EventDisposition::PassThrough);
+    left.wake_epoch.fetch_add(1, Ordering::Relaxed);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+
+    left.set_hold(Some(FOREVER));
+    assert_eq!(left.press(), EventDisposition::PassThrough);
+    assert_eq!(left.release(), EventDisposition::PassThrough);
+    left.assert_nothing_queued();
+}
+
+/// The epoch moves on the suspend itself, so a lock is already stale in the gap
+/// between the thaw and logind reporting the resume.
+#[tokio::test]
+async fn a_suspend_moves_the_wake_epoch_before_any_resume() {
+    let (signal, gate) = openlogi_hid::device_io_channel();
+    let epoch = Arc::new(AtomicU64::new(0));
+    let counter = tokio::spawn(count_suspends(gate, epoch.clone()));
+
+    assert!(signal.suspend());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while epoch.load(Ordering::Relaxed) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the suspend advances the epoch while the gate is still closed");
+
+    assert!(signal.resume());
+    drop(signal);
+    counter.await.expect("the counter ends with its producer");
+    assert_eq!(epoch.load(Ordering::Relaxed), 1, "only the suspend counts");
 }

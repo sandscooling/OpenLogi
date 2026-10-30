@@ -314,6 +314,10 @@ impl Armed {
         // HID++ watchers need no Accessibility — start them up front.
         running.restart_hidpp_watchers();
         let (mut watchers, inventory_refresh) = startup::spawn_state_watchers(&running.shared);
+        tokio::spawn(hook::count_suspends(
+            openlogi_hid::host::device_io_gate(),
+            running.shared.wake_epoch.clone(),
+        ));
         let mut ring = running.inputs.ring.subscribe();
 
         info!("openlogi-agent started");
@@ -650,6 +654,7 @@ impl Running {
             self.inputs.dispatcher.clone(),
             self.inputs.scroll_input.clone(),
             Arc::clone(&self.event_monitor),
+            self.shared.wake_epoch.clone(),
         )
     }
 

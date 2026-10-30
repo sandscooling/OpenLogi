@@ -26,10 +26,10 @@ use super::control::Cid;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ButtonId {
     /// The primary button. Rebindable in the config schema, but the OS hook
-    /// never suppresses it — see [`ButtonId::is_os_hook_button`].
+    /// never remaps it (see [`ButtonId::is_os_hook_button`]). The only edges it
+    /// suppresses are click lock's, which no binding sees.
     LeftClick,
-    /// The secondary button. Like [`ButtonId::LeftClick`], it always passes
-    /// through the OS hook.
+    /// The secondary button. It always passes through the OS hook.
     RightClick,
     /// The wheel click — one of the three buttons the OS hook remaps.
     MiddleClick,
@@ -114,8 +114,9 @@ impl ButtonId {
     }
 
     /// Whether this button is one the OS hook (macOS `CGEventTap` / Linux evdev)
-    /// remaps: Middle, Back, or Forward. The primary L/R clicks always pass
-    /// through (suppressing them would brick the mouse), and the DPI / thumb /
+    /// remaps: Middle, Back, or Forward. The primary L/R clicks are never
+    /// remap candidates (taking them over would brick the mouse; click lock
+    /// only holds a left edge back, outside this set), and the DPI / thumb /
     /// dedicated gesture controls aren't visible to the OS hook at all (they're
     /// captured over HID++). Stored gesture bindings also project through this
     /// set, including Middle Click gestures.
