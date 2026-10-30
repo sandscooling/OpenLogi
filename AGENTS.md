@@ -249,6 +249,8 @@ contains only OpenLogi integration constraints and verification entrypoints.
 | planning a regression test, selecting checks after changes, or verifying an authorized commit/push | [verifying-openlogi-changes](.agents/skills/verifying-openlogi-changes/SKILL.md) |
 | recording, reviewing, or contributing device profiles and HID++ cassettes | [contributing-device-fixtures](.agents/skills/contributing-device-fixtures/SKILL.md) |
 | a macOS report of no devices / "Failed to open device" / which permission to grant, and any change to the permission, helper-launch, or bundle-signing code | `.claude/skills/openlogi-macos-permissions/SKILL.md` |
+| stress-testing a plan or design by interview (`/grill-me` is the user-invoked entry point) | [grilling](.agents/skills/grilling/SKILL.md), [grill-me](.agents/skills/grill-me/SKILL.md) |
+| a throwaway prototype that answers a logic or UI design question | [prototype](.agents/skills/prototype/SKILL.md) |
 
 The four OpenLogi workflow skills are maintained locally with the code. Keep
 mandatory invariants in this file and the scoped rules; link to those rules from
@@ -265,3 +267,5 @@ source revision above. Claude Code uses the tracked symlinks in `.claude/skills/
 Other local skills remain ignored by Git.
 
 The ast-grep skill is imported unchanged from [ast-grep/agent-skill](https://github.com/ast-grep/agent-skill/tree/f2175aff21f20cfb8e2db30c28febeb3a2d42b61/ast-grep/skills/ast-grep). `skills-lock.json` records its upstream content hash. Its [MIT license](.agents/skills/LICENSE-MIT-ast-grep) comes from [ast-grep/ast-grep](https://github.com/ast-grep/ast-grep/blob/4118186ecca8f4935ae8d85ee6d43c3211f3b763/LICENSE). Review upstream changes before updating the source revision, files, and lock together.
+
+The grill-me, grilling, and prototype skills are imported unchanged from [mattpocock/skills](https://github.com/mattpocock/skills/tree/a496f5513d4a4cf889bc48e189e579f4b0bdf6aa/skills), with the upstream [MIT license](.agents/skills/LICENSE-MIT-mattpocock). `skills-lock.json` records their upstream content hashes. Review upstream changes before updating the source revision, files, and lock together.

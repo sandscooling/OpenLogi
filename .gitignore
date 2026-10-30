@@ -35,6 +35,10 @@ devenv.local.yaml
 !/.agents/skills/LICENSE-APACHE
 !/.agents/skills/ast-grep/
 !/.agents/skills/LICENSE-MIT-ast-grep
+!/.agents/skills/grill-me/
+!/.agents/skills/grilling/
+!/.agents/skills/prototype/
+!/.agents/skills/LICENSE-MIT-mattpocock
 
 # Local planning docs — kept on disk, never committed.
 /UI.md
@@ -61,6 +65,9 @@ devenv.local.yaml
 !/.claude/skills/verifying-openlogi-changes
 !/.claude/skills/contributing-device-fixtures
 !/.claude/skills/ast-grep
+!/.claude/skills/grill-me
+!/.claude/skills/grilling
+!/.claude/skills/prototype
 
 # No Node project is tracked. This keeps an old install of the removed
 # release-notes script out of `git status`.
