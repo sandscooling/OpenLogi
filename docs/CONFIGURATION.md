@@ -48,7 +48,7 @@ v12 adds the per-device `chords` and `per_app_chords` tables and the
 
 ## Shape
 
-`schema_version` is required and currently `11`. `selected_device` is an
+`schema_version` is required and currently `12`. `selected_device` is an
 optional physical device key.
 
 `[app_settings]` contains application-wide preferences:
