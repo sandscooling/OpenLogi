@@ -997,15 +997,14 @@ async fn a_pointer_only_plan_refresh_keeps_a_held_gesture() {
     actions.shutdown();
 }
 
-/// A dispatcher over live action and scroll runtimes. The Actions Ring is the
-/// one action that reports over a channel instead of injecting input, so its
-/// receiver counts what runs.
+/// A dispatcher over live action and scroll runtimes. The Actions Ring reports
+/// over a channel instead of injecting input, so its receiver counts what runs.
 #[cfg(target_os = "linux")]
 fn chord_rig() -> (
     crate::runtime::ActionRuntime,
     crate::runtime::scroll::ScrollRuntime,
     InputDispatcher,
-    mpsc::UnboundedReceiver<Option<String>>,
+    mpsc::UnboundedReceiver<crate::runtime::ActionRequest>,
 ) {
     use crate::runtime::scroll::{ScrollPreferences, ScrollRuntime};
 
@@ -1049,12 +1048,17 @@ fn ring_chord(chord: &str) -> crate::runtime::ChordTable {
 }
 
 #[cfg(target_os = "linux")]
-async fn ring_shown(ring_rx: &mut mpsc::UnboundedReceiver<Option<String>>) {
+async fn ring_shown(ring_rx: &mut mpsc::UnboundedReceiver<crate::runtime::ActionRequest>) {
     let shown = tokio::time::timeout(Duration::from_secs(1), ring_rx.recv())
         .await
         .expect("the ring is shown")
         .expect("the ring channel stays open");
-    assert_eq!(shown.as_deref(), Some("mouse-a"));
+    assert_eq!(
+        shown,
+        crate::runtime::ActionRequest::ShowActionsRing {
+            device_key: Some("mouse-a".to_owned()),
+        }
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -1118,10 +1122,8 @@ async fn a_click_only_gesture_source_clicks_alone_and_chords_with_a_partner() {
     );
 
     actions.shutdown();
-    let extra: Vec<_> = std::iter::from_fn(|| ring_rx.try_recv().ok())
-        .flatten()
-        .collect();
-    assert_eq!(extra, Vec::<String>::new(), "the click is dropped");
+    let extra: Vec<_> = std::iter::from_fn(|| ring_rx.try_recv().ok()).collect();
+    assert_eq!(extra, Vec::new(), "the click is dropped");
     scroll.shutdown();
 }
 

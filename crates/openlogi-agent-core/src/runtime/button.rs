@@ -304,6 +304,11 @@ impl ActivePress {
         self.token.key.source.device_key()
     }
 
+    /// Whether the OS input hook, rather than an HID++ session, captured it.
+    pub(crate) fn captured_by_os_hook(&self) -> bool {
+        matches!(self.token.key.source, ButtonSource::OsHook(_))
+    }
+
     /// The action this press runs as it starts. An open chord window holds
     /// it back, and [`Self::commit_chord`] hands it over if no chord completes.
     pub(crate) fn start_action(&self) -> Option<&Action> {

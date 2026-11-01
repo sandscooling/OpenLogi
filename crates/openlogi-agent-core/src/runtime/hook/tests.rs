@@ -55,7 +55,7 @@ fn test_dispatcher() -> (
                 device_io: openlogi_hid::device_io_channel().1,
                 transport_turns: crate::hardware::TransportTurns::default(),
             },
-            action_ring,
+            requests: action_ring,
         },
         buttons: owner.input(),
     };
@@ -235,7 +235,7 @@ fn queued_key_action_retains_its_press_time_target() {
     );
     assert_eq!(
         queued.recv().expect("action should be queued"),
-        (Action::BrowserBack, target)
+        (Action::BrowserBack, target, PressControl::Key(keycode))
     );
     assert!(owner.shutdown());
 }

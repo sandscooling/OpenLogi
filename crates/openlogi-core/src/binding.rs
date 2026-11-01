@@ -33,7 +33,7 @@ pub use action_ring::{
     RingAction, RingActionError,
 };
 pub use application_target::{ApplicationTarget, ApplicationTargetError};
-pub use button::{ButtonId, ParseButtonIdError};
+pub use button::{ButtonId, GridKey, GridSlot, KeypadPage, ParseButtonIdError};
 pub use category::Category;
 pub use chord::{ChordId, ParseChordIdError};
 pub use control::{Cid, KNOWN_CONTROLS, KnownControl, UNKNOWN_CONTROL_TRANSLATION_KEY};
