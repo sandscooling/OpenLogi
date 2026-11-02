@@ -893,6 +893,7 @@ fn a_pointer_change_cancels_a_held_back_solo_like_a_long_press() {
     let mut back = press(1, ButtonId::Back, Some(&binding), &chords, start);
     back.target = ActionDispatchTarget::Pointer {
         target: PointerTarget::Desktop,
+        focus: crate::runtime::FocusBinding::Distinct,
         fallback_safari_pid: None,
     };
     apply(&mut state, ButtonInput::Down(back));
@@ -911,6 +912,7 @@ fn a_pointer_change_ends_a_chord_but_not_the_members_release() {
     let chords = table(WINDOW);
     let target = ActionDispatchTarget::Pointer {
         target: PointerTarget::Desktop,
+        focus: crate::runtime::FocusBinding::Distinct,
         fallback_safari_pid: None,
     };
     let mut state = ButtonState::default();

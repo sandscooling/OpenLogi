@@ -27,18 +27,23 @@
     reason = "the wake pipes, the /dev/input watch, and the Wayland toplevel listener call libc directly"
 )]
 
+mod button_debounce;
 mod foreground;
 pub(crate) mod pointer;
+pub(crate) mod probe;
 mod supervisor;
+mod wheel;
 #[cfg(test)]
 mod xvfb;
 
 use std::io;
+use std::ops::ControlFlow;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant, SystemTime};
 
 use evdev::uinput::VirtualDevice;
 use evdev::{
@@ -53,10 +58,12 @@ use crate::{
     ButtonId, CursorPosition, Delivery, EventDevice, EventDisposition, ForegroundApp, HookBackend,
     HookError, HookEvent, LOGITECH_VENDOR_ID, MouseEvent,
 };
+use button_debounce::{ButtonChange, ButtonDebounce};
 use foreground::{FRONTMOST, X11Source};
 pub(crate) use foreground::{
     ForegroundApplicationObserver, watch_frontmost_application_activations,
 };
+use wheel::{PassThroughWheel, WheelEvent};
 
 /// Hi-res scroll resolution: 120 units per standard wheel tick, matching the
 /// Linux kernel's `REL_WHEEL_HI_RES` convention and Windows HID semantics.
@@ -274,11 +281,20 @@ fn build_virtual_device(device: &Device) -> io::Result<evdev::uinput::VirtualDev
     builder.build()
 }
 
-/// Block until `device_fd` has data or `stop_fd` is readable.
-///
-/// Returns `true` when the device is ready to read, `false` on stop signal or
-/// unrecoverable poll error.
-fn wait_readable(device_fd: i32, stop_fd: i32) -> bool {
+/// What woke a device thread.
+#[derive(Debug, PartialEq, Eq)]
+enum Wake {
+    /// The device has events to read.
+    Readable,
+    /// The deadline passed with nothing to read.
+    Deadline,
+    /// A stop signal, or an error that ends the thread.
+    Stop,
+}
+
+/// Block until `device_fd` has data, `stop_fd` is readable, or `deadline`
+/// passes. Without a deadline, wait for one of the two descriptors only.
+fn wait(device_fd: i32, stop_fd: i32, deadline: Option<Instant>) -> Wake {
     const ERR_FLAGS: libc::c_short = libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
     let mut fds = [
         libc::pollfd {
@@ -293,15 +309,21 @@ fn wait_readable(device_fd: i32, stop_fd: i32) -> bool {
         },
     ];
     loop {
+        let timeout = deadline.map_or(-1, |at| {
+            poll_timeout(at.saturating_duration_since(Instant::now()))
+        });
         // SAFETY: fds is a valid two-element pollfd array.
-        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, timeout) };
         if ret < 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::Interrupted {
                 continue; // interrupted by signal — retry
             }
             error!("poll() failed: {err}");
-            return false;
+            return Wake::Stop;
+        }
+        if ret == 0 {
+            return Wake::Deadline;
         }
         // An error/hangup on either fd (e.g. the grabbed device was unplugged →
         // POLLHUP) leaves it permanently "ready", so without this check neither
@@ -309,17 +331,77 @@ fn wait_readable(device_fd: i32, stop_fd: i32) -> bool {
         // so the caller exits the thread and releases the grab.
         if fds[0].revents & ERR_FLAGS != 0 {
             warn!("hooked device closed or errored; stopping its thread");
-            return false;
+            return Wake::Stop;
         }
         if fds[1].revents & ERR_FLAGS != 0 {
-            return false; // stop pipe closed → shut down
+            return Wake::Stop; // stop pipe closed → shut down
         }
         if fds[1].revents & libc::POLLIN != 0 {
-            return false; // stop signal
+            return Wake::Stop; // stop signal
         }
         if fds[0].revents & libc::POLLIN != 0 {
-            return true; // device has data
+            return Wake::Readable; // device has data
         }
+    }
+}
+
+/// `poll`'s timeout for `left`, rounded up to whole milliseconds so the
+/// thread never wakes before a deadline.
+fn poll_timeout(left: Duration) -> libc::c_int {
+    libc::c_int::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(libc::c_int::MAX)
+}
+
+/// When a report happened, on the clock of `read_at`, the moment it was
+/// read. `wall_at` is the wall clock at that moment, the clock of the
+/// kernel's `report` timestamp.
+///
+/// A report is timed by how long before the read it happened, so reports
+/// that queue up behind a slow thread keep their spacing, within one read
+/// and across reads: the button debouncer does not take a bounce read late
+/// for a click, nor a double click read late for a bounce. The debouncer
+/// itself runs on the monotonic clock, so a step of the wall clock mistimes
+/// at most the reports of one read. A timestamp after `wall_at`, as after
+/// the wall clock stepped back, counts as read at `read_at`.
+fn report_time(read_at: Instant, wall_at: SystemTime, report: SystemTime) -> Instant {
+    let age = wall_at.duration_since(report).unwrap_or_default();
+    read_at.checked_sub(age).unwrap_or(read_at)
+}
+
+/// Re-inject `pending` as one report, if it holds anything, and clear it.
+///
+/// The physical device is grabbed, so these pass-through events can't reach
+/// the desktop any other way. A uinput emit failure means the virtual device
+/// is broken, so it breaks: the thread stops, and dropping the grab restores
+/// normal input, rather than silently dropping events on every report.
+fn emit_report(
+    virtual_device: &mut VirtualDevice,
+    pending: &mut Vec<InputEvent>,
+    path: &std::path::Path,
+) -> ControlFlow<()> {
+    if pending.is_empty() {
+        return ControlFlow::Continue(());
+    }
+    if let Err(e) = virtual_device.emit(pending) {
+        error!(
+            "uinput emit failed on {}: {e} — stopping hook for this device",
+            path.display()
+        );
+        return ControlFlow::Break(());
+    }
+    pending.clear();
+    ControlFlow::Continue(())
+}
+
+/// Hand debounced button changes to the callback, queueing those it
+/// forwards for the pass-through report.
+fn deliver_buttons(
+    changes: impl IntoIterator<Item = ButtonChange>,
+    source: &EventDevice,
+    cb: &dyn Fn(HookEvent) -> EventDisposition,
+    pending: &mut Vec<InputEvent>,
+) {
+    for change in changes {
+        pending.extend(dispatch(change.into(), false, false, source, cb));
     }
 }
 
@@ -420,66 +502,9 @@ fn key_to_button(key: KeyCode) -> Option<ButtonId> {
     }
 }
 
-/// Low-res wheel events (`REL_WHEEL`/`REL_HWHEEL`) held back for one report.
-///
-/// A hi-res device emits both a hi-res and a low-res event per notch. libinput
-/// ignores the low-res one when the hi-res one is present, but desktops that
-/// read the *discrete* axis value (mutter 42) derive it from the low-res count,
-/// so a pass-through that drops it scrolls nothing. The low-res event is
-/// therefore forwarded exactly when the hi-res event on the same axis was; when
-/// the hi-res one was suppressed, the action injector re-emits both and a
-/// forwarded companion would double the scroll distance.
-#[derive(Default)]
-struct LowResCompanions {
-    held: Vec<evdev::InputEvent>,
-    vertical_forwarded: bool,
-    horizontal_forwarded: bool,
-}
-
-impl LowResCompanions {
-    fn is_low_res(axis: RelativeAxisCode) -> bool {
-        matches!(
-            axis,
-            RelativeAxisCode::REL_WHEEL | RelativeAxisCode::REL_HWHEEL
-        )
-    }
-
-    fn hold(&mut self, event: evdev::InputEvent) {
-        self.held.push(event);
-    }
-
-    /// Record that the hi-res event for `axis` is being passed through.
-    fn hires_forwarded(&mut self, axis: RelativeAxisCode) {
-        match axis {
-            RelativeAxisCode::REL_WHEEL_HI_RES => self.vertical_forwarded = true,
-            RelativeAxisCode::REL_HWHEEL_HI_RES => self.horizontal_forwarded = true,
-            _ => {}
-        }
-    }
-
-    /// Move the companions whose hi-res event was forwarded into `pending` and
-    /// reset for the next report. `inverted` applies software scroll inversion
-    /// to the low-res vertical companion too, so it agrees with its hi-res
-    /// event for clients that read the discrete axis.
-    fn release_into(&mut self, pending: &mut Vec<evdev::InputEvent>, inverted: bool) {
-        for event in self.held.drain(..) {
-            let forwarded = match RelativeAxisCode(event.code()) {
-                RelativeAxisCode::REL_WHEEL => self.vertical_forwarded,
-                RelativeAxisCode::REL_HWHEEL => self.horizontal_forwarded,
-                _ => false,
-            };
-            if forwarded {
-                pending.push(invert_wheel(event, inverted));
-            }
-        }
-        self.vertical_forwarded = false;
-        self.horizontal_forwarded = false;
-    }
-}
-
 /// Whether `event` is evdev's autorepeat (value 2) of the left button.
 ///
-/// A held button means nothing new, but [`translate`] reads any non-zero value
+/// A held button means nothing new, but the debounce reads any non-zero value
 /// as a press, and on the left button click lock would take a second press of
 /// a held button for the click that ends a lock. No other event is touched.
 fn is_left_autorepeat(event: &InputEvent) -> bool {
@@ -489,8 +514,27 @@ fn is_left_autorepeat(event: &InputEvent) -> bool {
     )
 }
 
+/// Keep what is not a button change out of the debounce: returns `event` when
+/// the caller still has to handle it. A left autorepeat is dropped here, before
+/// the debounce, which would deliver it as a press once another button has
+/// taken over its tracking.
+fn take_button(event: InputEvent, buttons: &mut ButtonDebounce) -> Option<InputEvent> {
+    if is_left_autorepeat(&event) {
+        return None;
+    }
+    match ButtonChange::try_from(event) {
+        Ok(change) => {
+            // Debounced with the rest of its report, when the report ends.
+            buttons.changed(change);
+            None
+        }
+        Err(()) => Some(event),
+    }
+}
+
 /// Run one event past the callback and return what to forward to the desktop
-/// for it, if anything. Held low-res companions never get here.
+/// for it, if anything. On a hi-res device, wheel events reach it only
+/// through [`PassThroughWheel`], and low-res counts never do.
 ///
 /// `invert` is the report's software-inversion setting, already narrowed by
 /// the caller to vertical wheel events. Through [`Delivery`] the callback
@@ -506,9 +550,6 @@ fn dispatch(
     source: &EventDevice,
     cb: &dyn Fn(HookEvent) -> EventDisposition,
 ) -> Option<InputEvent> {
-    if is_left_autorepeat(&event) {
-        return None;
-    }
     let delivery = translate(&event, hires_scroll)
         .map(|mut mouse| {
             if let MouseEvent::Button { device, .. } = &mut mouse {
@@ -523,6 +564,19 @@ fn dispatch(
     match delivery.disposition {
         EventDisposition::PassThrough => Some(invert_wheel(event, delivery.invert_native)),
         EventDisposition::Suppress => None,
+    }
+}
+
+/// The device a grabbed mouse's events name as their source.
+///
+/// Ids only. Every hooked device is a Logitech relative-pointer mouse (see
+/// `find_mouse_devices`), and without a name `source_is_remappable` stays
+/// true for all of them, as it was before button events named a device.
+fn event_source(device: &Device) -> EventDevice {
+    EventDevice {
+        vendor_id: Some(u32::from(device.input_id().vendor())),
+        product_id: Some(u32::from(device.input_id().product())),
+        product_name: None,
     }
 }
 
@@ -552,20 +606,17 @@ fn device_thread(
     let hires_scroll = device
         .supported_relative_axes()
         .is_some_and(|axes| axes.contains(RelativeAxisCode::REL_WHEEL_HI_RES));
-    // Ids only. Every hooked device is a Logitech relative-pointer mouse (see
-    // `find_mouse_devices`), and without a name `source_is_remappable` stays
-    // true for all of them, as it was before button events named a device.
-    let source = EventDevice {
-        vendor_id: Some(u32::from(device.input_id().vendor())),
-        product_id: Some(u32::from(device.input_id().product())),
-        product_name: None,
-    };
+    let source = event_source(&device);
 
     let device_fd = device.as_raw_fd();
     let stop_fd = stop_rx.as_raw_fd();
     // Events that will be re-injected at the next SYN_REPORT.
     let mut pending: Vec<evdev::InputEvent> = Vec::new();
-    let mut companions = LowResCompanions::default();
+    // libinput skips its wheel debouncing on the uinput pass-through device,
+    // so the hook applies it before the callback sees the wheel.
+    let mut wheel = PassThroughWheel::default();
+    // The same for its button debouncing, before the callback sees a button.
+    let mut buttons = ButtonDebounce::for_device(&device.input_id());
     // Software scroll inversion, read once per report so a hi-res event and its
     // low-res companion never disagree if the setting flips mid-report.
     let mut report_inverted: Option<bool> = None;
@@ -576,52 +627,63 @@ fn device_thread(
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        if !wait_readable(device_fd, stop_fd) {
-            break;
+        match wait(device_fd, stop_fd, buttons.deadline()) {
+            Wake::Readable => {}
+            Wake::Deadline => {
+                // A held button change is due, and no report came to carry it.
+                deliver_buttons(buttons.expire(Instant::now()), &source, &*cb, &mut pending);
+                if emit_report(&mut virtual_device, &mut pending, &path).is_break() {
+                    break;
+                }
+                continue;
+            }
+            Wake::Stop => break,
         }
 
-        let events = match device.fetch_events() {
-            Ok(iter) => iter,
+        let events: Vec<InputEvent> = match device.fetch_events() {
+            Ok(iter) => iter.collect(),
             Err(e) => {
                 error!("read error on {}: {e}", path.display());
                 break;
             }
         };
+        // Both clocks at the read, to time each report by its kernel timestamp.
+        let (read_at, wall_at) = (Instant::now(), SystemTime::now());
 
         for event in events {
             if let EventSummary::Synchronization(..) = event.destructure() {
+                let now = report_time(read_at, wall_at, event.timestamp());
+                deliver_buttons(buttons.end_report(now), &source, &*cb, &mut pending);
                 // Flush the report. `emit()` appends its own SYN_REPORT, so the
                 // incoming sync event is dropped rather than re-emitted — pushing
                 // it would send a redundant second SYN_REPORT.
                 let inverted = report_inverted
                     .take()
                     .unwrap_or_else(crate::scroll_inversion);
-                companions.release_into(&mut pending, inverted);
-                if !pending.is_empty() {
-                    if let Err(e) = virtual_device.emit(&pending) {
-                        // The physical device is grabbed, so these pass-through
-                        // events can't reach the desktop any other way. A uinput
-                        // emit failure means the virtual device is broken, so
-                        // stop here — dropping the grab restores normal input —
-                        // rather than silently dropping events on every report.
-                        error!(
-                            "uinput emit failed on {}: {e} — stopping hook for this device",
-                            path.display()
-                        );
-                        break 'read;
+                wheel.end_report(&mut pending, inverted);
+                if emit_report(&mut virtual_device, &mut pending, &path).is_break() {
+                    break 'read;
+                }
+            } else if let Some(event) = take_button(event, &mut buttons) {
+                let wheel_event = WheelEvent::try_from(event).ok().filter(|_| hires_scroll);
+                let mut released = None;
+                let event = match wheel_event {
+                    Some(WheelEvent::LowRes(axis, value)) => {
+                        // Redundant for the callback. It goes out with the
+                        // hi-res movement on its axis, or not at all.
+                        wheel.low_res(axis, value);
+                        continue;
                     }
-                    pending.clear();
-                }
-            } else {
-                if hires_scroll
-                    && let EventSummary::RelativeAxis(_, axis, _) = event.destructure()
-                    && LowResCompanions::is_low_res(axis)
-                {
-                    // Redundant for the callback; whether it reaches the desktop
-                    // depends on what happens to the hi-res event in this report.
-                    companions.hold(event);
-                    continue;
-                }
+                    Some(WheelEvent::HiRes(axis, value)) => {
+                        let Some(event) = wheel.hi_res(axis, value, event.timestamp()) else {
+                            // Held back while the wheel is at rest.
+                            continue;
+                        };
+                        released = Some(axis);
+                        event
+                    }
+                    None => event,
+                };
                 let is_vertical_wheel = matches!(
                     event.destructure(),
                     EventSummary::RelativeAxis(
@@ -633,8 +695,8 @@ fn device_thread(
                 let invert = is_vertical_wheel
                     && *report_inverted.get_or_insert_with(crate::scroll_inversion);
                 if let Some(forwarded) = dispatch(event, hires_scroll, invert, &source, &*cb) {
-                    if let EventSummary::RelativeAxis(_, axis, _) = event.destructure() {
-                        companions.hires_forwarded(axis);
+                    if let Some(axis) = released {
+                        wheel.forwarded(axis);
                     }
                     pending.push(forwarded);
                 }
@@ -642,6 +704,15 @@ fn device_thread(
         }
     }
 
+    // A release held as a possible bounce is still the user's: deliver it
+    // before the grab goes, so a remapped button is not left held. What
+    // `pending` still holds is a report that failed to emit or never ended,
+    // and the thread stops either way, so an emit failure only adds to the log.
+    if let Some(change) = buttons.release_held(Instant::now()) {
+        pending.clear();
+        deliver_buttons([change], &source, &*cb, &mut pending);
+        let _ = emit_report(&mut virtual_device, &mut pending, &path);
+    }
     debug!("hook stopped on {}", path.display());
     // Dropping `device` releases the exclusive grab, restoring normal input delivery.
 }
@@ -845,55 +916,93 @@ mod tests {
         assert!(translate(&event, true).is_none());
     }
 
-    // ── LowResCompanions ─────────────────────────────────────────────────────
+    // ── waking and report times ──────────────────────────────────────────────
 
-    fn rel(axis: RelativeAxisCode, value: i32) -> InputEvent {
-        InputEvent::new(EventType::RELATIVE.0, axis.0, value)
-    }
+    /// A device thread wakes at a button deadline even with nothing to read,
+    /// not before it, and still wakes for data and for a stop.
+    #[test]
+    fn wait_wakes_at_the_deadline_for_data_and_for_a_stop() {
+        let (device_rx, device_tx) = create_pipe().expect("device pipe");
+        let (stop_rx, stop_tx) = create_pipe().expect("stop pipe");
+        let (device_fd, stop_fd) = (device_rx.as_raw_fd(), stop_rx.as_raw_fd());
 
-    fn pending_codes(pending: &[InputEvent]) -> Vec<u16> {
-        pending.iter().map(InputEvent::code).collect()
+        let deadline = Instant::now() + Duration::from_millis(5);
+        assert_eq!(wait(device_fd, stop_fd, Some(deadline)), Wake::Deadline);
+        assert!(Instant::now() >= deadline);
+
+        signal_pipe(&device_tx);
+        let far = Instant::now() + Duration::from_secs(60);
+        assert_eq!(wait(device_fd, stop_fd, Some(far)), Wake::Readable);
+        assert_eq!(wait(device_fd, stop_fd, None), Wake::Readable);
+
+        signal_pipe(&stop_tx);
+        assert_eq!(wait(device_fd, stop_fd, Some(far)), Wake::Stop);
     }
 
     #[test]
-    fn low_res_wheel_forwarded_when_hires_forwarded() {
-        let mut companions = LowResCompanions::default();
-        let mut pending = Vec::new();
-        companions.hold(rel(RelativeAxisCode::REL_WHEEL, -1));
-        companions.hires_forwarded(RelativeAxisCode::REL_WHEEL_HI_RES);
-        companions.release_into(&mut pending, false);
-        assert_eq!(pending_codes(&pending), [RelativeAxisCode::REL_WHEEL.0]);
+    fn poll_timeout_rounds_up_to_whole_milliseconds() {
+        assert_eq!(poll_timeout(Duration::ZERO), 0);
+        assert_eq!(poll_timeout(Duration::from_nanos(1)), 1);
+        assert_eq!(poll_timeout(Duration::from_millis(25)), 25);
+        assert_eq!(poll_timeout(Duration::from_micros(25_001)), 26);
+        assert_eq!(poll_timeout(Duration::MAX), libc::c_int::MAX);
     }
 
+    /// A report is timed by how long before the read it happened, so reports
+    /// read late, together or not, keep their spacing. A timestamp after the
+    /// read, as after the wall clock stepped back, counts as read at the read.
     #[test]
-    fn low_res_wheel_dropped_when_hires_suppressed() {
-        let mut companions = LowResCompanions::default();
-        let mut pending = Vec::new();
-        companions.hold(rel(RelativeAxisCode::REL_WHEEL, -1));
-        companions.release_into(&mut pending, false);
-        assert!(pending.is_empty());
+    fn report_time_counts_back_from_the_read() {
+        let read_at = Instant::now();
+        let wall_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let ms = Duration::from_millis;
+        assert_eq!(report_time(read_at, wall_at, wall_at), read_at);
+        assert_eq!(
+            report_time(read_at, wall_at, wall_at.checked_sub(ms(40)).unwrap()),
+            read_at.checked_sub(ms(40)).unwrap()
+        );
+        assert_eq!(report_time(read_at, wall_at, wall_at + ms(40)), read_at);
     }
 
+    /// A bounce that queues up while the thread is held up is still a bounce:
+    /// its reports are timed when they happened, not when they were read.
     #[test]
-    fn low_res_axes_are_matched_independently() {
-        let mut companions = LowResCompanions::default();
-        let mut pending = Vec::new();
-        companions.hold(rel(RelativeAxisCode::REL_WHEEL, 1));
-        companions.hold(rel(RelativeAxisCode::REL_HWHEEL, 1));
-        companions.hires_forwarded(RelativeAxisCode::REL_HWHEEL_HI_RES);
-        companions.release_into(&mut pending, false);
-        assert_eq!(pending_codes(&pending), [RelativeAxisCode::REL_HWHEEL.0]);
-    }
+    fn a_bounce_read_late_is_still_filtered() {
+        use evdev::{BusType, InputId};
 
-    #[test]
-    fn forwarded_state_does_not_leak_into_next_report() {
-        let mut companions = LowResCompanions::default();
-        let mut pending = Vec::new();
-        companions.hires_forwarded(RelativeAxisCode::REL_WHEEL_HI_RES);
-        companions.release_into(&mut pending, false);
-        companions.hold(rel(RelativeAxisCode::REL_WHEEL, 1));
-        companions.release_into(&mut pending, false);
-        assert!(pending.is_empty());
+        let press = ButtonChange {
+            button: KeyCode::BTN_LEFT,
+            pressed: true,
+        };
+        let release = ButtonChange {
+            pressed: false,
+            ..press
+        };
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let mut buttons =
+            ButtonDebounce::for_device(&InputId::new(BusType::BUS_USB, 0x046D, 0xB034, 0));
+
+        buttons.changed(press);
+        assert_eq!(buttons.end_report(report_time(start, wall, wall)), [press]);
+
+        // The release at 1 ms and the press at 2 ms are read at 100 ms.
+        let (read_at, wall_at) = (start + ms(100), wall + ms(100));
+        buttons.changed(release);
+        assert!(
+            buttons
+                .end_report(report_time(read_at, wall_at, wall + ms(1)))
+                .is_empty()
+        );
+        buttons.changed(press);
+        assert!(
+            buttons
+                .end_report(report_time(read_at, wall_at, wall + ms(2)))
+                .is_empty()
+        );
+        assert!(buttons.expire(read_at).is_empty());
+        assert_eq!(buttons.deadline(), None);
     }
 
     #[test]
@@ -1129,29 +1238,82 @@ mod tests {
         assert!(crate::source_is_remappable(Some(&device)));
     }
 
-    /// Value 2 of the left button is dropped before the callback, which would
-    /// read it as a second press, and before the desktop.
-    #[test]
-    fn a_left_autorepeat_reaches_nothing() {
-        let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_LEFT.0, 2);
-        let forwarded = dispatch(event, false, false, &EventDevice::default(), &|_| {
-            panic!("the callback must not see an autorepeat")
-        });
-        assert!(forwarded.is_none());
+    fn take_all(buttons: &mut ButtonDebounce, events: &[InputEvent]) {
+        for &event in events {
+            assert!(
+                take_button(event, buttons).is_none(),
+                "{event:?} is a button event"
+            );
+        }
     }
 
-    /// Only left loses its repeat, as in the script click lock replaces. Every
-    /// other button still reaches the callback and the desktop as it did.
+    /// Hold left, tap another button, and the debounce no longer tracks left. A
+    /// left autorepeat then must not reach it, or it would deliver a second
+    /// press of the held button: click lock's "click that ends a lock".
     #[test]
-    fn another_buttons_autorepeat_is_untouched() {
+    fn a_left_autorepeat_reaches_nothing() {
+        use evdev::{BusType, InputId};
+
+        let key = |code: KeyCode, value| InputEvent::new(EventType::KEY.0, code.0, value);
+        let ms = Duration::from_millis;
+        let start = Instant::now();
+        let mut buttons =
+            ButtonDebounce::for_device(&InputId::new(BusType::BUS_USB, 0x046D, 0xB034, 0));
+        for (at, event) in [
+            (0, key(KeyCode::BTN_LEFT, 1)),
+            (100, key(KeyCode::BTN_SIDE, 1)),
+            (200, key(KeyCode::BTN_SIDE, 0)),
+        ] {
+            take_all(&mut buttons, &[event]);
+            assert_eq!(buttons.end_report(start + ms(at)).len(), 1);
+        }
+
+        take_all(&mut buttons, &[key(KeyCode::BTN_LEFT, 2)]);
+        assert!(buttons.end_report(start + ms(300)).is_empty());
+        assert_eq!(buttons.deadline(), None, "and nothing is left to deliver");
+    }
+
+    /// A left autorepeat in the same report as another change does not make
+    /// that report "several", which would cancel the change's bounce timers.
+    #[test]
+    fn a_left_autorepeat_leaves_a_real_change_alone() {
+        use evdev::{BusType, InputId};
+
+        let key = |code: KeyCode, value| InputEvent::new(EventType::KEY.0, code.0, value);
+        let start = Instant::now();
+        let mut buttons =
+            ButtonDebounce::for_device(&InputId::new(BusType::BUS_USB, 0x046D, 0xB034, 0));
+        take_all(
+            &mut buttons,
+            &[key(KeyCode::BTN_LEFT, 2), key(KeyCode::BTN_SIDE, 1)],
+        );
+        let delivered = buttons.end_report(start);
+        assert_eq!(
+            delivered,
+            [ButtonChange {
+                button: KeyCode::BTN_SIDE,
+                pressed: true
+            }]
+        );
+    }
+
+    /// Only left loses its repeat, as in the script click lock replaces. Any
+    /// other button's still goes to the debounce like every change of it.
+    #[test]
+    fn another_buttons_autorepeat_still_reaches_the_debounce() {
+        use evdev::{BusType, InputId};
+
         let event = InputEvent::new(EventType::KEY.0, KeyCode::BTN_MIDDLE.0, 2);
-        let seen = std::cell::Cell::new(false);
-        let forwarded = dispatch(event, false, false, &EventDevice::default(), &|_| {
-            seen.set(true);
-            EventDisposition::PassThrough
-        });
-        assert!(seen.get(), "the callback sees it");
-        assert_eq!(forwarded.map(|event| event.value()), Some(2));
+        let mut buttons =
+            ButtonDebounce::for_device(&InputId::new(BusType::BUS_USB, 0x046D, 0xB034, 0));
+        assert!(take_button(event, &mut buttons).is_none());
+        assert_eq!(
+            buttons.end_report(Instant::now()),
+            [ButtonChange {
+                button: KeyCode::BTN_MIDDLE,
+                pressed: true
+            }]
+        );
     }
 
     /// A key that is no mouse button is forwarded as it came, without troubling
@@ -1214,20 +1376,6 @@ mod scroll_inversion_tests {
         ] {
             assert_eq!(value_of(invert_wheel(rel(axis, 7), true)), 7);
         }
-    }
-
-    /// A forwarded low-res companion is negated with its hi-res event, so a
-    /// client reading the discrete axis scrolls the same way as one reading
-    /// the hi-res axis.
-    #[test]
-    fn inversion_negates_the_released_low_res_companion() {
-        let mut companions = LowResCompanions::default();
-        companions.hold(rel(RelativeAxisCode::REL_WHEEL, 1));
-        companions.hires_forwarded(RelativeAxisCode::REL_WHEEL_HI_RES);
-        let mut pending = Vec::new();
-        companions.release_into(&mut pending, true);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(value_of(pending[0]), -1);
     }
 
     /// `i32::MIN` has no positive counterpart; saturating keeps the scroll

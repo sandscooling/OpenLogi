@@ -41,9 +41,10 @@ use tracing::{debug, info, warn};
 
 use crate::action_ring::ActionRingSessionSpec;
 use crate::capture_plan::{
-    CapturePublication, SharedCapturePlans, hidpp_side_gesture_maps_for, plan_for_device,
-    shift_bindings_for,
+    CapturePublication, PlanDevice, SharedCapturePlans, buttons_unlike_focus,
+    hidpp_side_gesture_maps_for, plan_for_device, shift_bindings_for,
 };
+use crate::flow::{FlowController, InventoryDevice};
 use crate::hardware::{
     DeviceAccess, DeviceOp, HardwareContext, KeptOsLayouts, VolatileMouseSettings, WriteOrder,
     show_precision_led, write_pointer_speed_in_background,
@@ -53,9 +54,9 @@ use crate::observable::ObservableState;
 use crate::pointer_speed::{AppWrite, ReloadChange, SavedSpeed, SpeedMouse, SpeedWrite};
 use crate::receiver_access::ReceiverAccess;
 use crate::runtime::ChordTable;
-use crate::runtime::PageTurn;
 use crate::runtime::hook::{HookMaps, SharedHookMaps};
 use crate::runtime::scroll::ScrollPreferences;
+use crate::runtime::{PageTurn, PointerSelection};
 use crate::watchers::host_switch::{HostSwitchLink, HostSwitchLinks};
 use crate::watchers::inventory::InventoryRefresh;
 use crate::watchers::key_display::{KeyDisplaySpec, KeyFace, SharedKeyDisplaySpecs};
@@ -174,6 +175,9 @@ pub struct SharedHandles {
     /// Receiver access shared by HID++ sessions and pairing. Pairing/host
     /// transitions are exclusive; capture sessions share under read leases.
     pub receiver_access: ReceiverAccess,
+    /// Flow peers, edge detection, and device handoff. Dormant until the
+    /// agent arms it.
+    pub flow: FlowController,
     /// Per-transport turns for agent-owned HID requests. Shared by every
     /// device access built from these handles, so two slots of one receiver
     /// queue behind each other before either starts its response timeout.
@@ -688,6 +692,14 @@ impl Orchestrator {
         let (host_switch_links_tx, host_switch_links) = watch::channel(Arc::new(Vec::new()));
         let (watched_lights_tx, watched_lights) = watch::channel(Arc::new(Vec::new()));
         openlogi_inject::set_desktop_switch(desktop_switch(&config.app_settings));
+        let receiver_access = ReceiverAccess::default();
+        let flow = FlowController::new(
+            &config.flow,
+            Arc::clone(&observable),
+            hardware.channel_pool(),
+            receiver_access.clone(),
+            hardware.device_io(),
+        );
         let shared = SharedHandles {
             device_io: hardware.device_io(),
             channel_pool: hardware.channel_pool(),
@@ -707,7 +719,8 @@ impl Orchestrator {
             keyboard_channel: Arc::new(RwLock::new(None)),
             key_display_specs,
             capture_rearm_generation: Arc::new(AtomicU64::new(0)),
-            receiver_access: ReceiverAccess::default(),
+            receiver_access,
+            flow,
             transport_turns: crate::hardware::TransportTurns::default(),
             host_switch_links,
             watched_lights,
@@ -802,6 +815,22 @@ impl Orchestrator {
         (app, Some(target))
     }
 
+    /// The pointer context for `key`'s bindings resolved for `app`. It names
+    /// the buttons that the focused application binds otherwise, so a press of
+    /// any other button may send its keystrokes as focused mode does.
+    fn pointer_selection(
+        &self,
+        key: Option<&str>,
+        app: Option<&str>,
+        target: Option<openlogi_hook::PointerTarget>,
+    ) -> Option<PointerSelection> {
+        target.map(|target| {
+            let unlike_focus =
+                buttons_unlike_focus(&self.config, key, app, self.current_app.as_deref());
+            PointerSelection::new(target, unlike_focus)
+        })
+    }
+
     /// Build the OS-hook callback's maps for `key` and its mouse context. Both hook
     /// sub-maps are app-scoped (a per-app override can demote the gesture owner),
     /// so they're built together here and published under one lock — keeping
@@ -819,7 +848,10 @@ impl Orchestrator {
             };
         }
         let (app, pointer_target) = self.mouse_context();
-        let mut bindings = button_bindings_for(&self.config, key, app);
+        let pointer = self.pointer_selection(key, app, pointer_target);
+        // The OS hook only sees standard HID buttons, whose defaults no
+        // G-series layout changes, so this map needs no layout.
+        let mut bindings = button_bindings_for(&self.config, key, app, None);
         let chords = ChordTable::for_device(&self.config, key, app);
         let mut gestures = oshook_gestures_for(&self.config, key, app);
         if cfg!(target_os = "macos")
@@ -845,7 +877,7 @@ impl Orchestrator {
             bindings,
             chords,
             gestures,
-            pointer_target,
+            pointer,
             selected_device: key.map(str::to_owned),
             click_lock,
             shift_bindings,
@@ -866,15 +898,12 @@ impl Orchestrator {
     }
 
     /// Publish hook maps while preserving what hardware capture sessions
-    /// reported: thumb-wheel polarities, diverted buttons and held G-Shift
-    /// buttons. Selection, polarity, and bindings share the one lock the
-    /// callback reads, so a device switch cannot combine facts from two
-    /// devices.
+    /// reported: diverted buttons and held G-Shift buttons. Selection,
+    /// capture state, and bindings share the one lock the callback reads, so
+    /// a device switch cannot combine facts from two devices.
     fn publish_hook_maps(&self, mut maps: HookMaps) {
         match self.shared.hook_maps.write() {
             Ok(mut current) => {
-                maps.thumbwheel_positive_is_forward =
-                    std::mem::take(&mut current.thumbwheel_positive_is_forward);
                 maps.shift_held = std::mem::take(&mut current.shift_held);
                 maps.diverted_buttons = std::mem::take(&mut current.diverted_buttons);
                 *current = maps;
@@ -979,7 +1008,12 @@ impl Orchestrator {
     /// `config_key`'s stored bindings for the foreground app, across every
     /// keypad page.
     fn foreground_key_bindings(&self, config_key: &str) -> BTreeMap<ButtonId, Binding> {
-        button_bindings_for(&self.config, Some(config_key), self.current_app.as_deref())
+        button_bindings_for(
+            &self.config,
+            Some(config_key),
+            self.current_app.as_deref(),
+            None,
+        )
     }
 
     /// The part of `stored` that `config_key`'s keys act on now: its current
@@ -1084,6 +1118,7 @@ impl Orchestrator {
         publish_arc_if_changed(&self.watched_lights_tx, self.watched_lights());
         self.publish_lights();
         publish_arc_if_changed(&self.key_display_specs_tx, self.key_display_specs_for());
+        self.publish_flow();
     }
 
     /// What each online, enabled keypad's LCD keys should show: the glyph of
@@ -1117,6 +1152,33 @@ impl Orchestrator {
                 })
             })
             .collect()
+    }
+
+    /// Hand Flow its configuration and the devices it may move. Both
+    /// updates are no-ops when nothing changed.
+    fn publish_flow(&self) {
+        self.shared.flow.update_config(&self.config.flow);
+        self.shared.flow.update_devices(
+            self.devices
+                .iter()
+                .filter_map(Self::flow_inventory_device)
+                .collect(),
+        );
+    }
+
+    /// One device as Flow sees it, keyed like [`Self::capture_identity`].
+    fn flow_inventory_device(dev: &AgentDevice) -> Option<InventoryDevice> {
+        let identity = DeviceIdentity::from_parts(dev.serial.as_deref(), dev.unit_id);
+        let key = canonical_device_key(&stable_id(dev), Some(&identity))
+            .or_else(|| PhysicalDeviceKey::parse(&dev.config_key))?;
+        Some(InventoryDevice {
+            key,
+            route: dev.route.clone(),
+            serial: dev.serial.clone(),
+            unit_id: dev.unit_id,
+            kind: dev.kind,
+            online: dev.online,
+        })
     }
 
     fn publish_capture_plans(&self) {
@@ -1241,21 +1303,25 @@ impl Orchestrator {
             } else {
                 self.mouse_context()
             };
+            let layout = GamingLayout::for_model_key(&dev.model_key);
             let mut plan = plan_for_device(
                 &self.config,
-                physical_key,
-                &dev.config_key,
-                route,
+                PlanDevice {
+                    physical_key,
+                    config_key: &dev.config_key,
+                    route,
+                    layout,
+                },
                 app,
                 rearm_generation,
                 self.os_mouse_hook_available,
             );
-            plan.dispatch.pointer_target = pointer_target;
+            plan.dispatch.pointer =
+                self.pointer_selection(Some(&dev.config_key), app, pointer_target);
             plan.dispatch.invert_wheel = wheel_inverted(&self.config, dev);
             plan.target.spec.divert_main_wheel =
                 main_wheel_divert(&self.config, dev, self.os_mouse_hook_available);
-            let mut plan =
-                plan.with_onboard(&self.config, GamingLayout::for_model_key(&dev.model_key));
+            let mut plan = plan.with_onboard(&self.config, layout);
             if let Some(keyboard) = keyboards
                 .iter()
                 .find(|keyboard| keyboard.route == plan.target.route)
@@ -2406,7 +2472,7 @@ fn keyboard_divert_set(bindings: &BTreeMap<ButtonId, Binding>) -> KeyboardDivert
 /// single action, so its presence captures the key exactly as the same
 /// device-wide binding does.
 fn binds_keys_in_some_profile(config: &Config, config_key: &str) -> bool {
-    let device_wide = button_bindings_for(config, Some(config_key), None);
+    let device_wide = button_bindings_for(config, Some(config_key), None, None);
     !keyboard_divert_set(&device_wide).captures_nothing()
         || config
             .app_profiles(config_key)

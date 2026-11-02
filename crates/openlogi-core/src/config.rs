@@ -15,6 +15,7 @@ mod button_map;
 mod device;
 #[cfg(feature = "fs")]
 mod file;
+mod flow;
 mod function_key;
 mod gestures;
 mod identity;
@@ -39,6 +40,10 @@ use file::resolve_symlinks;
 pub use file::{ConfigError, ConfigFile};
 #[cfg(all(test, feature = "fs"))]
 use file::{backup_existing_config, config_backup_path};
+pub use flow::{
+    FlowConfig, FlowConfigError, FlowConfigParts, FlowDevice, FlowEdge, FlowHostSlot, FlowLayout,
+    FlowPeer, FlowPeerName, FlowPublicKey, SELF_CHANNEL,
+};
 pub use function_key::FunctionKey;
 pub use identity::canonical_device_key;
 pub use key_trigger::{KeyModifiers, KeyTrigger, KeyboardConfig, ParseTriggerError};
@@ -46,10 +51,11 @@ pub use revision::ConfigRevision;
 pub use settings::LightSettings;
 pub use settings::{
     AppIcon, AppSettings, Appearance, AssetSourcePreference, CameraControls, CameraStreamMode,
-    ChordSettings, ChordWindow, ClickLock, ClickLockHold, DeviceViewMode, Lighting,
-    MouseProfileTarget, OnboardMemory, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT,
-    SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution, SmartShift, ThumbwheelSensitivity, UiScale,
-    VerticalScrollSensitivity, WheelMode, chords_supported, click_lock_supported,
+    ChordSettings, ChordWindow, ClickLock, ClickLockHold, DeviceViewMode, GlideShape, Lighting,
+    MomentumParams, MomentumScrolling, MouseProfileTarget, OnboardMemory,
+    SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution, SmartShift,
+    ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity, WheelMode, chords_supported,
+    click_lock_supported,
 };
 
 use crate::app::AppAliases;
@@ -59,6 +65,13 @@ use crate::binding::{Binding, ButtonId, GestureDirection};
 /// The schema version the current build produces. Bumped whenever the
 /// persisted shape or enum vocabulary changes; readers inspect this value
 /// before consuming the rest of the file.
+///
+/// v13 adds the `[flow]` section for cross-machine device handoff. Nothing
+/// older needs migrating, and a file without it loads as disabled Flow. The
+/// bump makes a v12 build refuse a file that may hold `[flow]` at the version
+/// check, instead of failing on the unknown field. Upstream numbers this step
+/// v11, which here means click lock: a file an upstream v11 build wrote still
+/// loads, because its `[flow]` parses at every supported version.
 ///
 /// v12 adds per-device [`DeviceConfig::chords`] and
 /// [`DeviceConfig::per_app_chords`], and the app-wide [`AppSettings::chords`]
@@ -129,7 +142,7 @@ use crate::binding::{Binding, ButtonId, GestureDirection};
 /// next save; [`Config::load_from_path`] accepts supported versions `1` through
 /// [`SCHEMA_VERSION`] so an invalid or forward file fails loudly instead of
 /// silently losing bindings.
-pub const SCHEMA_VERSION: u32 = 12;
+pub const SCHEMA_VERSION: u32 = 13;
 
 /// Top-level config document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,6 +160,9 @@ pub struct Config {
     /// first paired device. `None` means "fall back to the first device".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_device: Option<String>,
+    /// Cross-machine Flow handoff configuration.
+    #[serde(default, skip_serializing_if = "FlowConfig::is_default")]
+    pub flow: FlowConfig,
     /// When set (see [`Self::ephemeral`]), [`Self::save_atomic`] is a no-op:
     /// this config never writes the on-disk file. Never true for a loaded or
     /// default-constructed config.
@@ -184,6 +200,7 @@ impl Default for Config {
             schema_version: SCHEMA_VERSION,
             app_settings: AppSettings::default(),
             selected_device: None,
+            flow: FlowConfig::default(),
             devices: BTreeMap::new(),
             ephemeral: false,
             keyboard: KeyboardConfig::default(),

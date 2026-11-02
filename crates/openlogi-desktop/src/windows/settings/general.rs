@@ -3,15 +3,18 @@
 use super::{
     App, AppState, ChordWindow, ClickLockHold, Disableable, Entity, FluentBuilder, IconName,
     InteractiveElement, ParentElement, SettingField, SettingGroup, SettingItem, SettingPage,
-    Sizable, Slider, SliderState, Styled, ThumbwheelSensitivity, VerticalScrollSensitivity, div,
-    h_flex, px, theme, v_flex,
+    SharedString, Sizable, Slider, SliderState, Styled, ThumbwheelSensitivity,
+    VerticalScrollSensitivity, div, theme,
 };
+use crate::ui::commit_slider::SliderUnit;
+use crate::ui::slider_row::SliderRow;
 use crate::ui::theme::Typography as _;
 use gpui_base::Button as BaseButton;
 use gpui_component::radio::{Radio, RadioGroup};
 use gpui_component::switch::Switch;
 use openlogi_core::config::{MouseProfileTarget, chords_supported, click_lock_supported};
 
+use crate::features::pointer::momentum::MomentumPanel;
 use crate::platform::registration::ServiceStatus;
 
 /// The page's two sensitivity sliders, named so a call site cannot swap two
@@ -43,6 +46,7 @@ pub(super) fn general_page(
     sliders: SensitivitySliders,
     click_lock: ClickLockRows,
     chord_window: ChordWindowRow,
+    momentum: Entity<MomentumPanel>,
     registration_status: ServiceStatus,
 ) -> SettingPage {
     let SensitivitySliders {
@@ -58,22 +62,20 @@ pub(super) fn general_page(
     };
     let group = group
         .item(smooth_scrolling_item())
-        .item(
-            SettingItem::new(
-                tr!("pointer.vertical_scroll_sensitivity"),
-                SettingField::render(move |_, _, cx| {
-                    vertical_scroll_sensitivity_field(&vertical_scroll, cx)
-                }),
-            )
-            .description(tr!("pointer.vertical_scroll_sensitivity_description")),
-        )
-        .item(
-            SettingItem::new(
-                tr!("pointer.thumb_wheel_sensitivity"),
-                SettingField::render(move |_, _, cx| thumbwheel_sensitivity_field(&thumbwheel, cx)),
-            )
-            .description(tr!("pointer.thumbwheel_sensitivity_description")),
-        );
+        .item(sensitivity_item(
+            tr!("pointer.vertical_scroll_sensitivity"),
+            tr!("pointer.vertical_scroll_sensitivity_description"),
+            vertical_scroll,
+            VerticalScrollSensitivity::MAX,
+            VerticalScrollSensitivity::DEFAULT,
+        ))
+        .item(sensitivity_item(
+            tr!("pointer.thumb_wheel_sensitivity"),
+            tr!("pointer.thumbwheel_sensitivity_description"),
+            thumbwheel,
+            ThumbwheelSensitivity::MAX,
+            ThumbwheelSensitivity::DEFAULT,
+        ));
     // Only macOS animates a desktop switch, so only macOS shows the switch.
     // `cfg!` keeps the item and its setter compiled, and used, everywhere.
     let group = if cfg!(target_os = "macos") {
@@ -121,10 +123,17 @@ pub(super) fn general_page(
         .item(low_battery_notifications_item())
         .item(lock_key_notifications_item());
 
+    // Momentum scrolling's app-wide default. A mouse can set its own on its
+    // Pointer tab; the card counts those.
+    let momentum_group = SettingGroup::new()
+        .title(tr!("pointer.momentum_title"))
+        .description(tr!("pointer.momentum_general_description"))
+        .item(SettingItem::render(move |_, _, _| momentum.clone()));
     SettingPage::new(tr!("app.general"))
         .icon(IconName::Settings)
         .resettable(false)
         .group(group)
+        .group(momentum_group)
 }
 
 fn mouse_profile_target_item() -> SettingItem {
@@ -208,47 +217,68 @@ fn click_lock_item(enabled: bool, can_run: bool) -> SettingItem {
     })
 }
 
-/// The click-lock hold-time slider.
+/// The click-lock hold-time slider. Seconds, because a hold reads shorter that
+/// way than as "3000 ms".
 fn click_lock_hold_item(
     slider: Entity<SliderState>,
     hold: ClickLockHold,
     can_run: bool,
 ) -> SettingItem {
-    SettingItem::new(
+    let label = |hold: ClickLockHold| {
+        let seconds = format!("{:.1}", hold.duration().as_secs_f32());
+        tr!("pointer.click_lock_hold_value", seconds => seconds)
+    };
+    let (title, description) = (
         tr!("pointer.click_lock_hold"),
-        SettingField::render(move |options, _, cx| {
-            let bar = Slider::new(&slider).disabled(options.is_disabled());
-            // Seconds, because the value column has no room for "3000 ms" beside
-            // a long caption.
-            let seconds = format!("{:.1}", hold.duration().as_secs_f32());
-            let value = tr!("pointer.click_lock_hold_value", seconds => seconds);
-            slider_field(bar, value.to_string(), hold == ClickLockHold::DEFAULT, cx)
+        tr!("pointer.click_lock_hold_description"),
+    );
+    SettingItem::render({
+        let (title, description) = (title.clone(), description.clone());
+        move |_, _, _| {
+            let bar = div()
+                .w_full()
                 .debug_selector(|| "click-lock-hold".into())
-        }),
-    )
-    .disabled(!can_run)
-    .description(tr!("pointer.click_lock_hold_description"))
+                .child(Slider::new(&slider).horizontal().disabled(!can_run));
+            SliderRow::new(title.clone(), bar)
+                .value(label(hold), [label(ClickLockHold::MAX)])
+                .when(hold == ClickLockHold::DEFAULT, |row| {
+                    row.marker(tr!("common.default"))
+                })
+                .description(description.clone())
+                .disabled(!can_run)
+        }
+    })
+    .keywords([title, description])
 }
 
 /// The chord window slider. Chords run over HID++ as well as the input hook,
 /// so unlike click lock this stays live without a hook.
 fn chord_window_item(row: ChordWindowRow) -> SettingItem {
     let ChordWindowRow { window, slider } = row;
-    SettingItem::new(
+    let label = |window: ChordWindow| {
+        let ms = u16::from(window).to_string();
+        tr!("pointer.chord_window_value", ms => ms)
+    };
+    let (title, description) = (
         tr!("pointer.chord_window"),
-        SettingField::render(move |_, _, cx| {
-            let ms = u16::from(window).to_string();
-            let value = tr!("pointer.chord_window_value", ms => ms);
-            slider_field(
-                Slider::new(&slider),
-                value.to_string(),
-                window == ChordWindow::DEFAULT,
-                cx,
-            )
-            .debug_selector(|| "chord-window".into())
-        }),
-    )
-    .description(tr!("pointer.chord_window_description"))
+        tr!("pointer.chord_window_description"),
+    );
+    SettingItem::render({
+        let (title, description) = (title.clone(), description.clone());
+        move |_, _, _| {
+            let bar = div()
+                .w_full()
+                .debug_selector(|| "chord-window".into())
+                .child(Slider::new(&slider).horizontal());
+            SliderRow::new(title.clone(), bar)
+                .value(label(window), [label(ChordWindow::MAX)])
+                .when(window == ChordWindow::DEFAULT, |row| {
+                    row.marker(tr!("common.default"))
+                })
+                .description(description.clone())
+        }
+    })
+    .keywords([title, description])
 }
 
 /// The smooth-scrolling switch.
@@ -313,53 +343,28 @@ fn lock_key_notifications_item() -> SettingItem {
     })
 }
 
-fn thumbwheel_sensitivity_field(slider: &Entity<SliderState>, cx: &mut App) -> gpui::Div {
-    let value = ThumbwheelSensitivity::from_rounded(slider.read(cx).value().start());
-    slider_field(
-        Slider::new(slider),
-        value.to_string(),
-        value == ThumbwheelSensitivity::DEFAULT,
-        cx,
-    )
-}
-
-fn vertical_scroll_sensitivity_field(slider: &Entity<SliderState>, cx: &mut App) -> gpui::Div {
-    let value = VerticalScrollSensitivity::from_rounded(slider.read(cx).value().start());
-    slider_field(
-        Slider::new(slider),
-        value.to_string(),
-        value == VerticalScrollSensitivity::DEFAULT,
-        cx,
-    )
-}
-
-fn slider_field(slider: Slider, value: String, is_default: bool, cx: &mut App) -> gpui::Div {
-    let pal = theme::palette(cx);
-    v_flex()
-        .flex_shrink_0()
-        .gap_1()
-        .child(
-            h_flex()
-                .items_center()
-                .gap_3()
-                .child(div().w(px(180.)).child(slider))
-                .child(
-                    div()
-                        .w(px(72.))
-                        .text_body()
-                        .text_color(pal.text_muted)
-                        .child(value),
-                ),
-        )
-        .when(is_default, |this| {
-            this.child(
-                div()
-                    .text_caption()
-                    .text_color(pal.text_muted)
-                    .whitespace_nowrap()
-                    .child(format!("({})", rust_i18n::t!("common.default"))),
-            )
-        })
+/// A sensitivity slider laid out as the device pages lay theirs out — label
+/// and value on one line, the slider across the row — with "Default" beside
+/// the value while it rests there. A custom item has no title of its own, so
+/// its title and description are its search keywords.
+fn sensitivity_item<T: SliderUnit + std::fmt::Display>(
+    title: SharedString,
+    description: SharedString,
+    slider: Entity<SliderState>,
+    max: T,
+    default: T,
+) -> SettingItem {
+    SettingItem::render({
+        let (title, description) = (title.clone(), description.clone());
+        move |_, _, cx| {
+            let value = T::from_slider(slider.read(cx).value().start());
+            SliderRow::new(title.clone(), Slider::new(&slider).horizontal())
+                .value(value.to_string(), [max.to_string()])
+                .when(value == default, |row| row.marker(tr!("common.default")))
+                .description(description.clone())
+        }
+    })
+    .keywords([title, description])
 }
 
 /// The launch-at-login switch — a persisted config value the agent reads
@@ -418,7 +423,7 @@ mod tests {
     use crate::state::{ConfigPersistence, Sources};
     use crate::windows::{WindowRegistry, settings};
     use gpui::{
-        AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, point, size,
+        AppContext as _, Bounds, Modifiers, TestAppContext, VisualTestContext, point, px, size,
     };
     use openlogi_core::config::{Config, UiScale};
 

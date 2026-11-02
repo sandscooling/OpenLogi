@@ -41,7 +41,7 @@ fn future_version_is_rejected_before_incompatible_fields_are_parsed() {
 }
 
 #[test]
-fn v9_without_disabled_keys_loads_and_a_save_stamps_v10() {
+fn v9_without_disabled_keys_loads_and_a_save_stamps_the_current_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.toml");
     fs::write(
@@ -68,7 +68,7 @@ fn v9_without_disabled_keys_loads_and_a_save_stamps_v10() {
 }
 
 #[test]
-fn v10_without_click_lock_loads_and_a_save_stamps_v11() {
+fn v10_without_click_lock_loads_and_a_save_stamps_the_current_schema() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.toml");
     fs::write(
@@ -80,9 +80,10 @@ fn v10_without_click_lock_loads_and_a_save_stamps_v11() {
     let (mut config, mut file) = ConfigFile::load_from_path(&path).expect("load v10 config");
     assert_eq!(config.schema_version, SCHEMA_VERSION);
     assert_eq!(config.app_settings.click_lock, ClickLock::default());
+    assert_eq!(config.flow, FlowConfig::default());
 
     config.app_settings.click_lock.enabled = true;
-    file.save(&config).expect("save v11 config");
+    file.save(&config).expect("save migrated config");
 
     let saved = fs::read_to_string(&path).expect("read saved config");
     assert!(
@@ -93,9 +94,79 @@ fn v10_without_click_lock_loads_and_a_save_stamps_v11() {
         saved.contains("[app_settings.click_lock]"),
         "saved: {saved}"
     );
-    let reloaded = Config::load_from_path(&path).expect("reload v11 config");
+    let reloaded = Config::load_from_path(&path).expect("reload migrated config");
     assert!(reloaded.app_settings.click_lock.enabled);
     assert!(reloaded.app_settings.smooth_scroll);
+}
+
+/// The live config this fork's v12 builds wrote: click lock and chords stay as
+/// they were, and the Flow step, numbered v13 here, adds only its defaults.
+#[test]
+fn v12_with_click_lock_and_chords_keeps_them_and_gets_the_flow_defaults() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "schema_version = 12\n\
+         [app_settings.click_lock]\n\
+         enabled = true\n\
+         hold_ms = 1500\n\n\
+         [app_settings.chords]\n\
+         window_ms = 80\n\n\
+         [devices.mouse.chords]\n\
+         \"Back+Forward\" = \"Copy\"\n\n\
+         [devices.mouse.per_app_chords.app]\n\
+         \"Back+Forward\" = \"Paste\"\n",
+    )
+    .expect("write v12 config");
+    let chord: crate::binding::ChordId = "Back+Forward".parse().expect("chord");
+
+    let (config, mut file) = ConfigFile::load_from_path(&path).expect("load v12 config");
+    let check = |config: &Config| {
+        assert_eq!(config.schema_version, SCHEMA_VERSION);
+        assert!(config.app_settings.click_lock.enabled);
+        assert_eq!(u16::from(config.app_settings.click_lock.hold_ms), 1500);
+        assert_eq!(u16::from(config.app_settings.chords.window_ms), 80);
+        let device = &config.devices["mouse"];
+        assert_eq!(device.chords.get(&chord), Some(&Action::Copy));
+        assert_eq!(
+            device.per_app_chords["app"].get(&chord),
+            Some(&Action::Paste)
+        );
+        assert_eq!(config.flow, FlowConfig::default());
+    };
+    check(&config);
+
+    file.save(&config).expect("save v13 config");
+    let saved = fs::read_to_string(&path).expect("read saved config");
+    assert!(
+        saved.starts_with(&format!("schema_version = {SCHEMA_VERSION}\n")),
+        "saved: {saved}"
+    );
+    check(&Config::load_from_path(&path).expect("reload v13 config"));
+}
+
+/// Upstream numbers its Flow step v11, this fork's click lock. Its file carries
+/// `[flow]` and nothing of click lock, and every field parses at any supported
+/// version, so it loads with Flow intact and click lock off.
+#[test]
+fn a_v11_file_from_an_upstream_build_keeps_its_flow() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "schema_version = 11\n\
+         [flow]\n\
+         enabled = true\n\
+         require_modifier = true\n",
+    )
+    .expect("write upstream v11 config");
+
+    let config = Config::load_from_path(&path).expect("load upstream v11 config");
+    assert_eq!(config.schema_version, SCHEMA_VERSION);
+    assert!(config.flow.enabled);
+    assert!(config.flow.require_modifier);
+    assert_eq!(config.app_settings.click_lock, ClickLock::default());
 }
 
 #[test]

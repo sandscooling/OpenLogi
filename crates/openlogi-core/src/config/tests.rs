@@ -10,6 +10,7 @@ mod app_settings;
 mod chords;
 mod device_settings;
 mod files;
+mod flow;
 mod gestures;
 mod identity;
 mod keyboard;

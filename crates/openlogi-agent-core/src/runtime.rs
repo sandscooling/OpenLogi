@@ -23,6 +23,7 @@ use self::button::{
     ButtonInputHandle, ButtonRuntimeEvent, ButtonRuntimeOwner, EndReason, PressControl,
 };
 pub(crate) use self::button::{ChordMember, HidppSessionId, PressToken};
+pub(crate) use self::pointer::{FocusBinding, PointerPress, PointerSelection};
 use crate::dpi::DpiBeforeShift;
 use crate::hardware::{
     DeviceAccess, restore_dpi_in_background, step_dpi_in_background,
@@ -90,11 +91,14 @@ pub(crate) enum ActionDispatchTarget {
     /// The ordinary browser-navigation shortcut target captured outside Safari.
     Keyboard,
     /// The pointer context that selected the binding. Validated off the tap
-    /// before output. An identified window or desktop is never substituted
-    /// with an unrelated foreground window; an unidentified target retains
-    /// the focused fallback captured with the press.
+    /// before output. Keystrokes from a binding that the focused application
+    /// shares go where focused mode sends them. Other keystrokes need the
+    /// identified hovered window to have focus. A shared binding and an
+    /// unidentified target retain the frontmost Safari captured with the
+    /// press, as focused mode does.
     Pointer {
         target: openlogi_hook::PointerTarget,
+        focus: FocusBinding,
         fallback_safari_pid: Option<i32>,
     },
 }
@@ -105,16 +109,22 @@ impl ActionDispatchTarget {
     }
 
     fn for_pointer(
-        target: Option<openlogi_hook::PointerTarget>,
+        press: Option<PointerPress>,
         capture_safari_pid: impl FnOnce() -> Option<i32>,
     ) -> Self {
-        let safari_pid = match target {
-            None | Some(openlogi_hook::PointerTarget::Unavailable) => capture_safari_pid(),
-            Some(_) => None,
-        };
-        match target {
-            Some(target) => Self::Pointer {
+        // Focused mode, a shared binding, and an unidentified target send
+        // Safari navigation where focus is at the press.
+        let safari_pid = press
+            .is_none_or(|press| {
+                press.target == openlogi_hook::PointerTarget::Unavailable
+                    || press.focus == FocusBinding::Shared
+            })
+            .then(capture_safari_pid)
+            .flatten();
+        match press {
+            Some(PointerPress { target, focus }) => Self::Pointer {
                 target,
+                focus,
                 fallback_safari_pid: safari_pid,
             },
             None => safari_pid.map_or(Self::Keyboard, Self::SafariProcess),
@@ -746,12 +756,12 @@ impl ActionDispatcher {
         &self,
         action: &Action,
         device_key: Option<&str>,
-        target: Option<openlogi_hook::PointerTarget>,
+        pointer: Option<PointerPress>,
     ) {
         self.executor.dispatch_to(
             action,
             device_key,
-            ActionDispatchTarget::for_pointer(target, openlogi_hook::frontmost_safari_pid),
+            ActionDispatchTarget::for_pointer(pointer, openlogi_hook::frontmost_safari_pid),
         );
     }
 
@@ -821,14 +831,14 @@ impl ActionDispatcher {
         button: ButtonId,
         binding: Option<&Binding>,
         chord: Option<ChordMember>,
-        pointer_target: Option<openlogi_hook::PointerTarget>,
+        pointer: Option<PointerPress>,
     ) -> Option<PressToken> {
         self.buttons.try_hidpp_down(
             session,
             button,
             binding,
             chord,
-            ActionDispatchTarget::for_pointer(pointer_target, openlogi_hook::frontmost_safari_pid),
+            ActionDispatchTarget::for_pointer(pointer, openlogi_hook::frontmost_safari_pid),
         )
     }
 
@@ -844,13 +854,13 @@ impl ActionDispatcher {
         session: &HidppSessionId,
         button: ButtonId,
         binding: Option<&Binding>,
-        pointer_target: Option<openlogi_hook::PointerTarget>,
+        pointer: Option<PointerPress>,
     ) {
         self.buttons.try_hidpp_pulse(
             session,
             button,
             binding,
-            ActionDispatchTarget::for_pointer(pointer_target, openlogi_hook::frontmost_safari_pid),
+            ActionDispatchTarget::for_pointer(pointer, openlogi_hook::frontmost_safari_pid),
         );
     }
 
@@ -1130,7 +1140,9 @@ mod tests {
             &Action::ShowActionsRing,
             Some("mouse"),
             ActionDispatchTarget::for_pointer(
-                Some(openlogi_hook::PointerTarget::Unavailable),
+                Some(PointerPress::distinct(
+                    openlogi_hook::PointerTarget::Unavailable,
+                )),
                 || None,
             ),
         );
@@ -1162,7 +1174,9 @@ mod tests {
         };
         let unavailable = || {
             ActionDispatchTarget::for_pointer(
-                Some(openlogi_hook::PointerTarget::Unavailable),
+                Some(PointerPress::distinct(
+                    openlogi_hook::PointerTarget::Unavailable,
+                )),
                 || None,
             )
         };
