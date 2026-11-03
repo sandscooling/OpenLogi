@@ -32,11 +32,14 @@ pub(crate) use device_session::ObservedConnection;
 pub use devices::DeviceRecord;
 pub(crate) use easy_switch::HostRenameRefusal;
 pub(crate) use events::{StateEvent, StateEvents};
+pub(crate) use flow::{
+    FlowDeviceRow, FlowHealth, FlowHost, FlowIssue, FlowPairingRefusal, FlowReadiness,
+};
 pub use light::LightCommandStatus;
 pub(crate) use load::Load;
 pub use load::{
     BacklightLoad, DisableKeysLoad, DpiLoad, EasySwitchLoad, FnLockLoad, ForceSensingLoad,
-    OnboardLoad, PointerSpeedLoad, ReportRateLoad, SmartShiftLoad,
+    OnboardLoad, PointerSpeedLoad, ReportRateLoad, SidetoneLoad, SmartShiftLoad,
 };
 
 /// Result of confirming a SmartShift write by reading the value back.
@@ -85,6 +88,7 @@ mod disable_keys;
 mod dpi;
 mod easy_switch;
 mod events;
+mod flow;
 mod fn_lock;
 mod force_sensing;
 mod inventory;
@@ -99,6 +103,7 @@ mod reconciliation;
 mod report_rate;
 mod scroll;
 mod settings;
+mod sidetone;
 mod smartshift;
 
 #[cfg(test)]
@@ -255,6 +260,7 @@ impl AppState {
             state.load_current_fn_lock(cx);
             state.load_current_report_rate(cx);
             state.load_current_pointer_speed(cx);
+            state.load_current_sidetone(cx);
             state.load_current_force_sensing(cx);
             state.load_current_backlight(cx);
             state.load_current_easy_switch(cx);
