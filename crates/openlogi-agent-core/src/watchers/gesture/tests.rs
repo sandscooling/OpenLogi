@@ -1119,7 +1119,7 @@ async fn two_downs_from_one_report_fire_their_chord_once() {
 /// A gesture source with no raw XY reaches dispatch as a press and a release
 /// around its click, with no swipe. Alone it runs that click. With a chord
 /// partner the chord takes the press, and the click it still reports is
-/// dropped.
+/// dropped. Only the chord's release report follows its ring.
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn a_click_only_gesture_source_clicks_alone_and_chords_with_a_partner() {
@@ -1157,9 +1157,20 @@ async fn a_click_only_gesture_source_clicks_alone_and_chords_with_a_partner() {
         CapturedInput::ButtonUp(ButtonId::HapticPanel),
     );
 
+    // The chord's press opened the ring, so its release reports to the agent,
+    // which judges the hold. The click was queued before that release, so a
+    // click that reopened the ring would arrive first.
+    let next = tokio::time::timeout(Duration::from_secs(1), ring_rx.recv())
+        .await
+        .expect("the chord's release is reported")
+        .expect("the ring channel stays open");
+    assert_eq!(
+        next,
+        crate::runtime::ActionRequest::ActionsRingTriggerReleased,
+        "the click is dropped"
+    );
     actions.shutdown();
-    let extra: Vec<_> = std::iter::from_fn(|| ring_rx.try_recv().ok()).collect();
-    assert_eq!(extra, Vec::new(), "the click is dropped");
+    assert!(ring_rx.try_recv().is_err(), "nothing follows the release");
     scroll.shutdown();
 }
 

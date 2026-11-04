@@ -27,7 +27,7 @@ fn chord_view(
     persistence: ConfigPersistence,
     button: ButtonId,
 ) -> (Entity<MouseModelView>, &mut VisualTestContext) {
-    cx.update(gpui_component::init);
+    cx.update(gpui_kit::init);
     cx.update(|cx| {
         let resolver = AssetResolver::new();
         let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -365,7 +365,7 @@ fn left_and_right_offer_no_chords(cx: &mut TestAppContext) {
 fn a_device_with_no_saved_identity_offers_no_chords(cx: &mut TestAppContext) {
     let _locale = LOCALE_LOCK.lock().unwrap();
     rust_i18n::set_locale("en");
-    cx.update(gpui_component::init);
+    cx.update(gpui_kit::init);
     install_app_state(cx);
     let (view, cx) = cx.add_window_view(MouseModelView::new);
     cx.simulate_resize(size(px(1200.), px(1000.)));

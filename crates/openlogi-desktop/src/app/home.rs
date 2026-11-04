@@ -15,8 +15,8 @@ use gpui::{
     IntoElement, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Svg, Window,
     canvas, div, fill, img, point, prelude::FluentBuilder as _, px, rgb, svg,
 };
-use gpui_base::Button as BaseButton;
-use gpui_component::{
+use gpui_kit::base::Button as BaseButton;
+use gpui_kit::component::{
     Icon, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     dialog::DialogButtonProps,
@@ -448,11 +448,14 @@ pub(super) fn device_menu(
 /// The card corner's ellipsis button, opening the same menu the card offers
 /// on right-click.
 pub(super) fn device_menu_button(record: &DeviceRecord, pal: Palette) -> impl IntoElement {
+    let label = tr!("device.more_actions_for", name => record.display_name.clone());
     Button::new((ElementId::from("device-menu"), record.record_key()))
         .ghost()
-        .xsmall()
+        .small()
         .text_color(pal.text_muted)
         .icon(IconName::Ellipsis)
+        .accessibility_label(label.clone())
+        .tooltip(label)
         .dropdown_menu_with_anchor(Anchor::TopRight, device_menu(record))
 }
 

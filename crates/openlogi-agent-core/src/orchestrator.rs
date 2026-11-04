@@ -1981,6 +1981,7 @@ impl Orchestrator {
             haptic_route,
             layout,
             language: self.config.app_settings.language.clone(),
+            size: ring.size,
         })
     }
 

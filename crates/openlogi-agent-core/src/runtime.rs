@@ -10,7 +10,7 @@ pub mod hook;
 mod pointer;
 pub mod scroll;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::{Arc, Mutex, PoisonError, RwLock, mpsc};
 use std::time::{Duration, Instant};
@@ -73,6 +73,8 @@ pub enum ActionRequest {
         /// The pressing device.
         device_key: Option<String>,
     },
+    /// A button whose press opened the Actions Ring was released.
+    ActionsRingTriggerReleased,
     /// Turn the pressing keypad's binding page.
     TurnKeypadPage {
         /// The pressing device.
@@ -618,6 +620,10 @@ struct ButtonEventHandler {
     executor: ActionExecutor,
     held: HeldShortcuts,
     held_dpi: HeldDpiShifts,
+    /// Presses that opened the Actions Ring as they went down. Releasing one
+    /// can choose a slot; a ring a gesture or a long press opened stays open
+    /// past the release that follows it.
+    ring_triggers: HashSet<PressToken>,
 }
 
 impl ButtonEventHandler {
@@ -626,6 +632,7 @@ impl ButtonEventHandler {
             executor,
             held: HeldShortcuts::default(),
             held_dpi: HeldDpiShifts::default(),
+            ring_triggers: HashSet::new(),
         }
     }
 
@@ -636,6 +643,9 @@ impl ButtonEventHandler {
                     if press.captured_by_os_hook() {
                         log_bound_action(press.control(), action);
                     }
+                    if matches!(action, Action::ShowActionsRing) {
+                        self.ring_triggers.insert(press.token().clone());
+                    }
                     self.start_action(press.token(), action, press.device_key(), press.target());
                 }
             }
@@ -643,11 +653,31 @@ impl ButtonEventHandler {
                 if press.captured_by_os_hook() {
                     log_bound_action(press.control(), &action);
                 }
+                // A chord member's own action is held back past `Started` and
+                // committed here. It is still the press's start action, so a
+                // ring it opens answers to the release like any other.
+                if matches!(action, Action::ShowActionsRing)
+                    && press.start_action() == Some(&action)
+                {
+                    self.ring_triggers.insert(press.token().clone());
+                }
                 self.start_action(press.token(), &action, press.device_key(), press.target());
             }
             ButtonRuntimeEvent::Ended { press, reason } => {
                 self.held.end(press.token());
                 self.held_dpi.end(&self.executor, press.token());
+                // A canceled press may never have been let go, so it chooses
+                // nothing and the ring stays open for the pointer.
+                if self.ring_triggers.remove(press.token())
+                    && reason == EndReason::Released
+                    && self
+                        .executor
+                        .requests
+                        .send(ActionRequest::ActionsRingTriggerReleased)
+                        .is_err()
+                {
+                    warn!("agent runtime unavailable — Actions Ring release ignored");
+                }
                 if let EndReason::Canceled(reason) = reason {
                     match press.control() {
                         PressControl::Button(button) => {
@@ -1154,6 +1184,121 @@ mod tests {
             })
         );
     }
+
+    /// The release of a button that opened the ring reaches the agent, which
+    /// decides whether the hold chose a slot. A press canceled before its
+    /// release was seen must not choose.
+    #[test]
+    fn a_ring_trigger_reports_its_release_unless_canceled() {
+        let (_signal, device_io) = openlogi_hid::device_io_channel();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = ActionRuntime::new(
+            Arc::default(),
+            Arc::default(),
+            DeviceAccess {
+                channel: openlogi_hid::CaptureChannelSlot::default(),
+                registry: openlogi_hid::ChannelRegistry::default(),
+                receiver_access: crate::receiver_access::ReceiverAccess::default(),
+                device_io,
+                transport_turns: crate::hardware::TransportTurns::default(),
+            },
+            requests,
+        )
+        .expect("the button worker must start");
+        let buttons = runtime.dispatcher().buttons;
+        let ring = Binding::Single(Action::ShowActionsRing);
+        let opened = ActionRequest::ShowActionsRing { device_key: None };
+
+        buttons
+            .try_hook_down(ButtonId::MiddleClick, Some(&ring))
+            .expect("the press must be accepted");
+        assert!(buttons.try_hook_up(ButtonId::MiddleClick));
+        assert_eq!(received.blocking_recv(), Some(opened.clone()));
+        assert_eq!(
+            received.blocking_recv(),
+            Some(ActionRequest::ActionsRingTriggerReleased)
+        );
+
+        buttons
+            .try_hook_down(ButtonId::MiddleClick, Some(&ring))
+            .expect("the press must be accepted");
+        buttons.cancel_hook_thread();
+        assert_eq!(received.blocking_recv(), Some(opened));
+        runtime.shutdown();
+        assert!(
+            received.try_recv().is_err(),
+            "a canceled trigger must not report a release"
+        );
+    }
+
+    /// A chord member holds its own action back until its window closes, so
+    /// the ring it opens arrives as a trigger, not at the press's start. The
+    /// release must still reach the agent, or a held member could never
+    /// choose a slot.
+    #[test]
+    fn a_held_back_chord_member_still_reports_its_ring_release() {
+        if !openlogi_core::config::chords_supported() {
+            return;
+        }
+        let mut config = openlogi_core::config::Config::default();
+        config.app_settings.capture_mouse_events = true;
+        config
+            .devices
+            .entry("mouse".into())
+            .or_default()
+            .chords
+            .insert("Back+Forward".parse().expect("valid chord"), Action::Copy);
+        let member = ChordTable::for_device(&config, Some("mouse"), None)
+            .member(ButtonId::Back)
+            .expect("Back is a chord member");
+        let (_signal, device_io) = openlogi_hid::device_io_channel();
+        let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut runtime = ActionRuntime::new(
+            Arc::default(),
+            Arc::default(),
+            DeviceAccess {
+                channel: openlogi_hid::CaptureChannelSlot::default(),
+                registry: openlogi_hid::ChannelRegistry::default(),
+                receiver_access: crate::receiver_access::ReceiverAccess::default(),
+                device_io,
+                transport_turns: crate::hardware::TransportTurns::default(),
+            },
+            requests,
+        )
+        .expect("the button worker must start");
+        let buttons = runtime.dispatcher().buttons;
+        let ring = Binding::Single(Action::ShowActionsRing);
+
+        buttons
+            .try_hook_down_with_target(
+                ButtonId::Back,
+                Some(&ring),
+                Some(member),
+                ActionDispatchTarget::capture(),
+            )
+            .expect("the press must be accepted");
+        assert_eq!(
+            received.blocking_recv(),
+            Some(ActionRequest::ShowActionsRing { device_key: None }),
+            "the window's close must open the ring"
+        );
+        assert!(buttons.try_hook_up(ButtonId::Back));
+        // Bounded, so a release that never comes fails instead of hanging.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let released = loop {
+            match received.try_recv() {
+                Ok(request) => break Some(request),
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break None,
+            }
+        };
+        assert_eq!(released, Some(ActionRequest::ActionsRingTriggerReleased));
+        runtime.shutdown();
+        assert!(received.try_recv().is_err(), "the ring must open only once");
+    }
+
     /// Page actions go to the agent, keyed by the pressing keypad, and — like
     /// the ring — no pointer target gates them: the press acts on the keypad.
     #[test]

@@ -15,16 +15,18 @@
 //! Unifying just opens a lock and waits for the next device to link, so it
 //! jumps straight from *searching* to *paired*.
 
+use crate::ui::theme::FocusRingStyle as _;
 use gpui::{
     App, Context, ElementId, FocusHandle, FontWeight, Global, InteractiveElement, IntoElement,
     ParentElement as _, Render, SharedString, Size, StatefulInteractiveElement as _, Styled as _,
     Subscription, Window, div, prelude::FluentBuilder as _, px, svg,
 };
-use gpui_base::Button as BaseButton;
-use gpui_component::{
+use gpui_kit::base::Button as BaseButton;
+use gpui_kit::component::{
     Icon, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
+    scroll::ScrollableElement as _,
     spinner::Spinner,
     v_flex,
 };
@@ -32,7 +34,7 @@ use openlogi_core::device::ReceiverInfo;
 use openlogi_core::hid::{Click, PasskeyMethod, ReceiverSelector, find_receiver};
 use openlogi_ipc::{FoundDevice, PairingFailure, PairingPhase};
 
-use crate::app::menu::{CloseWindow, Minimize, Zoom};
+use crate::app::menu::{DIALOG_KEY_CONTEXT, Dismiss};
 use crate::services::ipc::{CancelPairing, Command, PairDevice, StartPairing};
 use crate::state::{AppState, StateEvent};
 use crate::ui::components::control_button;
@@ -332,10 +334,9 @@ impl Render for AddDeviceView {
             .size_full()
             .bg(pal.page)
             .text_color(pal.text_primary)
+            .key_context(DIALOG_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
-            .on_action(|_: &CloseWindow, window, _| window.remove_window())
-            .on_action(|_: &Minimize, window, _| window.minimize_window())
-            .on_action(|_: &Zoom, window, _| window.zoom_window())
+            .on_action(|_: &Dismiss, window, cx| dismiss(window, cx))
             // Only where the compositor left the chrome to us; the padded
             // content sits in the flex-column below it.
             .when(windows::needs_client_titlebar(window), |this| {
@@ -346,21 +347,23 @@ impl Render for AddDeviceView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .px_6()
                     .pt_6()
                     .gap_5()
                     .child(
                         v_flex()
+                            .px_6()
                             .gap_1()
                             .child(div().text_heading().child(title))
                             .when_some(subtitle, |this, subtitle| this.child(hint(subtitle, pal))),
                     )
+                    // The scroll owner spans the window, so its scrollbar sits
+                    // on the window edge; the page inset lives inside it.
                     .child(
                         div()
-                            .id("pairing-content")
                             .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
+                            .px_6()
+                            .overflow_y_scrollbar()
+                            .id("pairing-content")
                             .child(body),
                     ),
             )
@@ -410,6 +413,16 @@ fn pairing_body(state: &PairingUi, pal: Palette) -> gpui::Div {
                 matches!(failure, PairingFailure::ReceiverNotFound),
                 |this| this.child(hint(tr!("device.device_connection_help"), pal)),
             ),
+    }
+}
+
+/// Escape: what the step's leading button does — close the window before a
+/// receiver is chosen, otherwise end the search and return to the picker.
+fn dismiss(window: &mut Window, cx: &mut App) {
+    match cx.try_global::<PairingUi>().cloned().unwrap_or_default() {
+        PairingUi::Idle => window.remove_window(),
+        PairingUi::Cancelling => {}
+        _ => cancel_search(cx),
     }
 }
 
@@ -481,7 +494,7 @@ fn choice_row(id: impl Into<ElementId>, label: SharedString, pal: Palette) -> Ba
         .bg(pal.control)
         .cursor_pointer()
         .hover(|s| s.bg(pal.control_hover))
-        .focus_visible(|s| s.bg(pal.control_hover).border_color(theme::accent()))
+        .focus_visible(move |s| s.focus_ring(pal))
         .child(div().flex_1().min_w_0().truncate().text_body().child(label))
         .child(
             Icon::new(IconName::ChevronRight)
@@ -502,6 +515,7 @@ fn device_row(device: &FoundDevice, pal: Palette) -> impl IntoElement {
         SharedString::from(device.name.clone()),
         pal,
     )
+    .debug_selector(move || format!("pairing-device-{address_id:012x}"))
     .on_click(move |_, _, cx| send(cx, PairDevice { address }))
 }
 

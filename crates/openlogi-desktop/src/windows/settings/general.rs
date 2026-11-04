@@ -8,10 +8,11 @@ use super::{
 };
 use crate::ui::commit_slider::SliderUnit;
 use crate::ui::slider_row::SliderRow;
+use crate::ui::theme::FocusRingStyle as _;
 use crate::ui::theme::Typography as _;
-use gpui_base::Button as BaseButton;
-use gpui_component::radio::{Radio, RadioGroup};
-use gpui_component::switch::Switch;
+use gpui_kit::base::Button as BaseButton;
+use gpui_kit::component::radio::{Radio, RadioGroup};
+use gpui_kit::component::switch::Switch;
 use openlogi_core::config::{MouseProfileTarget, chords_supported, click_lock_supported};
 
 use crate::features::pointer::momentum::MomentumPanel;
@@ -411,7 +412,7 @@ fn open_login_items_button(cx: &App) -> BaseButton {
         .cursor_pointer()
         .bg(pal.control)
         .hover(move |s| s.bg(pal.control_hover))
-        .focus_visible(move |s| s.bg(pal.control_hover))
+        .focus_visible(move |s| s.focus_ring(pal))
         .child(tr!("app.open_login_items"))
         .on_click(|_, _, _| crate::platform::registration::open_login_items_settings())
 }
@@ -435,7 +436,7 @@ mod tests {
         read_only: bool,
     ) -> VisualTestContext {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             theme::register_builtin_themes(cx);
         });
         let handle = cx.update(|cx| {
@@ -653,7 +654,7 @@ mod tests {
     fn mouse_profile_target_choices_update_state_and_respect_failed_saves(cx: &mut TestAppContext) {
         let _locale = LOCALE_LOCK.lock().unwrap();
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             theme::register_builtin_themes(cx);
         });
 

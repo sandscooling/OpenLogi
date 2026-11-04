@@ -1,12 +1,13 @@
 //! Debug-only gallery for reviewing shared controls without app runtime state.
 
+use super::theme::FocusRingStyle as _;
 use gpui::{
     App, AppContext as _, Context, InteractiveElement, IntoElement, ParentElement, Render, Role,
     SharedString, Size, StatefulInteractiveElement as _, Styled, Window, WindowOptions, div,
     prelude::FluentBuilder as _, px, rems,
 };
-use gpui_base::Button as BaseButton;
-use gpui_component::{
+use gpui_kit::base::Button as BaseButton;
+use gpui_kit::component::{
     ActiveTheme as _, Disableable as _, Icon, IconName, Root, Selectable as _, Sizable as _, Theme,
     ThemeMode, ThemeRegistry,
     button::{Button, ButtonVariants as _},
@@ -33,9 +34,9 @@ const TITLE: &str = "OpenLogi Component Gallery";
 
 /// Run the isolated development gallery application.
 pub(crate) fn run() {
-    let app = gpui_platform::application().with_assets(crate::app_assets::AppAssets);
+    let app = gpui_kit::application().with_assets(crate::app_assets::AppAssets);
     app.run(|cx| {
-        gpui_component::init(cx);
+        gpui_kit::init(cx);
         theme::register_builtin_themes(cx);
         install_openlogi_themes(cx);
 
@@ -657,7 +658,7 @@ fn choice_card(id: &'static str, label: &'static str, selected: bool, pal: Palet
         })
         .bg(pal.control)
         .hover(move |style| style.bg(pal.control_hover))
-        .focus_visible(move |style| style.border_color(theme::accent()))
+        .focus_visible(move |style| style.focus_ring(pal))
         .gap_1()
         // A preview strip above the label: the stacked shape the settings
         // pickers rely on.
@@ -673,7 +674,7 @@ mod tests {
 
     #[gpui::test]
     fn gallery_renders_without_application_state(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
+        cx.update(gpui_kit::init);
         cx.update(theme::register_builtin_themes);
         cx.update(install_openlogi_themes);
         let (view, cx) = cx.add_window_view(|_, cx| ComponentGallery::new(cx));

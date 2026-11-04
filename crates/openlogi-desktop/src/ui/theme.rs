@@ -14,8 +14,10 @@
 
 #[cfg(test)]
 use gpui::rgb;
-use gpui::{App, FontWeight, Hsla, Pixels, Rems, Rgba, Styled, Window, hsla, px, relative, rems};
-use gpui_component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
+use gpui::{
+    App, BoxShadow, FontWeight, Hsla, Pixels, Rems, Rgba, Styled, Window, hsla, px, relative, rems,
+};
+use gpui_kit::component::{ActiveTheme as _, Theme, ThemeMode, ThemeRegistry};
 use openlogi_core::config::{Appearance, UiScale};
 
 use crate::state::AppState;
@@ -148,6 +150,12 @@ pub struct Palette {
     /// [`Palette::card_radius`] so a control's corner sits concentrically inside
     /// its card's.
     pub control_radius: Pixels,
+    /// The theme's keyboard-focus colour; see [`FocusRingStyle::focus_ring`].
+    pub ring: Hsla,
+    /// Error text: the theme's `danger` hue, darkened or lightened until it
+    /// reads at 4.5:1 on both the page and a card. `danger` itself is tuned as
+    /// a fill and fails as caption text on the light page.
+    pub text_danger: Hsla,
 }
 
 fn contrast_ratio(foreground: Hsla, background: Hsla) -> f32 {
@@ -199,6 +207,19 @@ fn accessible_muted_text(muted: Hsla, foreground: Hsla, background: Hsla, surfac
         .unwrap_or(foreground)
 }
 
+/// `color` with its hue and saturation kept and its lightness moved away from
+/// `background` until it meets [`MIN_TEXT_CONTRAST`] on both surfaces.
+fn legible_tint(color: Hsla, background: Hsla, surface: Hsla) -> Hsla {
+    let step = if background.l > 0.5 { -0.02 } else { 0.02 };
+    let mut tint = color;
+    while minimum_text_contrast(tint, background, surface) < MIN_TEXT_CONTRAST
+        && (0.0..=1.0).contains(&(tint.l + step))
+    {
+        tint.l += step;
+    }
+    tint
+}
+
 fn normalize_theme_text_contrast(theme: &mut Theme) {
     theme.muted_foreground = accessible_muted_text(
         theme.muted_foreground,
@@ -231,6 +252,8 @@ pub fn palette(cx: &App) -> Palette {
         text_muted: t.muted_foreground,
         card_radius: t.radius * 1.5,
         control_radius: t.radius,
+        ring: t.ring,
+        text_danger: legible_tint(t.danger, t.background, t.group_box),
     }
 }
 
@@ -250,7 +273,7 @@ pub const OPENLOGI_LIGHT: &str = "OpenLogi Light";
 pub const OPENLOGI_DARK: &str = "OpenLogi Dark";
 
 /// Register every bundled theme into the [`ThemeRegistry`]. Call once at
-/// startup, after `gpui_component::init` (which seeds the registry global). Our
+/// startup, after `gpui_kit::init` (which seeds the registry global). Our
 /// brand theme loads first; the upstream themes follow.
 pub fn register_builtin_themes(cx: &mut App) {
     let registry = ThemeRegistry::global_mut(cx);
@@ -424,6 +447,31 @@ pub trait SelectableStyle: Styled + Sized {
 
 impl<E: Styled> SelectableStyle for E {}
 
+/// Width of the halo [`FocusRingStyle::focus_ring`] paints outside the
+/// border, matching gpui-component's own `focus_ring_style`.
+const FOCUS_RING_WIDTH: Pixels = px(3.);
+
+/// The one keyboard-focus look for bespoke controls, so focus never reads as
+/// hover or selection. It matches the ring gpui-component's `Button` draws: the
+/// border takes the theme's `ring` colour and a half-opacity halo surrounds it.
+/// The halo is a spread shadow rather than the framework's extra child, so it
+/// fits inside a `focus_visible` refinement and never shifts layout.
+pub trait FocusRingStyle: Styled + Sized {
+    /// Style a `focus_visible` refinement with the shared focus ring.
+    #[must_use]
+    fn focus_ring(self, pal: Palette) -> Self {
+        self.border_color(pal.ring).shadow(vec![BoxShadow {
+            color: pal.ring.opacity(0.5),
+            offset: gpui::point(px(0.), px(0.)),
+            blur_radius: px(0.),
+            spread_radius: FOCUS_RING_WIDTH,
+            inset: false,
+        }])
+    }
+}
+
+impl<E: Styled> FocusRingStyle for E {}
+
 /// The app's type ramp as semantic roles, so a heading is `.text_heading()`
 /// everywhere instead of each call site re-picking a `text_*` size and a
 /// `font_weight`. Sizes, weights, and line heights live here once — an
@@ -480,14 +528,14 @@ impl<E: Styled> Typography for E {}
 
 #[cfg(test)]
 mod tests {
-    use gpui_component::button::Button;
+    use gpui_kit::component::button::Button;
 
     use super::*;
 
     #[gpui::test]
     fn bundled_theme_picker_keeps_upstream_and_openlogi_themes(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             register_builtin_themes(cx);
             let themes = ThemeRegistry::global(cx).themes();
             for name in [
@@ -566,7 +614,7 @@ mod tests {
     fn selected_segment_stands_out_in_both_openlogi_themes(cx: &mut gpui::TestAppContext) {
         const MIN_NON_TEXT_CONTRAST: f32 = 3.;
         cx.update(|cx| {
-            gpui_component::init(cx);
+            gpui_kit::init(cx);
             register_builtin_themes(cx);
             for (name, mode) in [
                 (OPENLOGI_LIGHT, ThemeMode::Light),
@@ -620,6 +668,40 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// Error captions sit on the page and on cards in both bundled themes. The
+    /// raw `danger` red fails there (3.45:1 on the light page, 4.2:1 on a dark
+    /// card), so the derived text colour must pass on both and stay red.
+    #[test]
+    fn danger_text_reads_on_page_and_card_in_both_openlogi_themes() {
+        let Ok(theme_set) = serde_json::from_str::<serde_json::Value>(OPENLOGI_THEME_JSON) else {
+            panic!("OpenLogi theme JSON should parse");
+        };
+        let Some(themes) = theme_set["themes"].as_array() else {
+            panic!("OpenLogi theme JSON should contain themes");
+        };
+
+        for theme in themes {
+            let name = theme["name"].as_str().unwrap_or("unnamed theme");
+            let colors = &theme["colors"];
+            let danger = theme_color(colors, "danger.background");
+            let page = theme_color(colors, "background");
+            let card = theme_color(colors, "group_box.background");
+
+            let text = legible_tint(danger, page, card);
+            for (surface, color) in [("page", page), ("card", card)] {
+                let ratio = contrast_ratio(text, color);
+                assert!(
+                    ratio >= MIN_TEXT_CONTRAST,
+                    "{name}: danger text is {ratio:.2}:1 on the {surface}"
+                );
+            }
+            assert!(
+                (text.h - danger.h).abs() < 1e-3 && (text.s - danger.s).abs() < 1e-3,
+                "{name}: danger text keeps the danger hue"
+            );
+        }
     }
 
     #[test]
