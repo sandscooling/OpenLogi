@@ -35,6 +35,7 @@ pub(crate) use events::{StateEvent, StateEvents};
 pub(crate) use flow::{
     FlowDeviceRow, FlowHealth, FlowHost, FlowIssue, FlowPairingRefusal, FlowReadiness,
 };
+pub(crate) use gaming_keys::GamingKeys;
 pub use light::LightCommandStatus;
 pub(crate) use load::Load;
 pub use load::{
@@ -91,6 +92,7 @@ mod events;
 mod flow;
 mod fn_lock;
 mod force_sensing;
+mod gaming_keys;
 mod inventory;
 mod light;
 mod lighting;

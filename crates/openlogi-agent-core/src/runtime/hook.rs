@@ -7,7 +7,7 @@ mod click_lock;
 mod diverted;
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, RwLock};
@@ -18,7 +18,7 @@ use openlogi_core::binding::{
     Action, Binding, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
 };
 use openlogi_core::config::KeyTrigger;
-use openlogi_hid::DeviceIoGate;
+use openlogi_hid::{DeviceIoGate, DeviceRoute};
 use openlogi_hook::{
     EventDevice, EventDisposition, Hook, HookEvent, KeyEvent, MouseEvent, source_is_remappable,
 };
@@ -59,10 +59,12 @@ pub struct HookMaps {
     /// Click lock's hold time, or `None` while it is off. Read only by a left
     /// press that could start a lock.
     pub(crate) click_lock: Option<Duration>,
-    /// OS-hook buttons that live HID++ capture sessions have diverted on
-    /// directly connected devices, reported by the sessions themselves. These
-    /// are hardware observations, not configuration, so they survive map
-    /// rebuilds.
+    /// The HID++ route of `selected_device`, which names that device's
+    /// capture sessions in `diverted_buttons`.
+    pub(crate) selected_route: Option<DeviceRoute>,
+    /// OS-hook buttons that live HID++ capture sessions have diverted,
+    /// reported by the sessions themselves. These are hardware observations,
+    /// not configuration, so they survive map rebuilds.
     pub(crate) diverted_buttons: DivertedButtons,
     /// The selected device's G-Shift bindings.
     pub(crate) shift_bindings: BTreeMap<ButtonId, Binding>,
@@ -100,9 +102,9 @@ impl HookMaps {
     /// runs its layer action, with no window a chord could take it from.
     fn chord_member(&self, id: ButtonId) -> Option<ChordMember> {
         let elsewhere = self
-            .selected_device
-            .as_deref()
-            .is_some_and(|key| self.diverted_buttons.reports_over_hidpp(key, id));
+            .selected_route
+            .as_ref()
+            .is_some_and(|route| self.diverted_buttons.diverted_on(route, id));
         let layered = self.shift_binding(id).is_some();
         self.chords.member(id).filter(|_| !elsewhere && !layered)
     }
@@ -116,6 +118,47 @@ impl HookMaps {
         } else {
             pointer.press(id)
         })
+    }
+
+    /// What a live HID++ diversion of `id` says about a press from `source`.
+    fn diverted_press(&self, id: ButtonId, source: Option<&EventDevice>) -> Option<DivertedPress> {
+        match source {
+            Some(source) => self
+                .diverted_buttons
+                .owns(source, id)
+                .then_some(DivertedPress::Echo),
+            None => self
+                .selected_route
+                .as_ref()
+                .is_some_and(|route| self.diverted_buttons.diverted_on(route, id))
+                .then_some(DivertedPress::OtherDevice),
+        }
+    }
+}
+
+/// A press of an OS-hook button that HID++ capture has taken over somewhere.
+/// Both edges of the press get the same disposition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DivertedPress {
+    /// The OS copy of a control a capture session diverted on the same device.
+    /// The session dispatches that press, so the hook must not dispatch it
+    /// again (#2158). It must not pass it through either: diversion already
+    /// took the control out of the native report, so this copy reaching the
+    /// desktop would be a second, unbound press.
+    Echo,
+    /// An unattributed press of a control the selected device has diverted.
+    /// None of that device's presses of it reach the OS, so another mouse sent
+    /// this one and the selected device's binding is not its own (#2381). It
+    /// stays native.
+    OtherDevice,
+}
+
+impl DivertedPress {
+    fn disposition(self) -> EventDisposition {
+        match self {
+            Self::Echo => EventDisposition::Suppress,
+            Self::OtherDevice => EventDisposition::PassThrough,
+        }
     }
 }
 
@@ -248,9 +291,10 @@ thread_local! {
     /// Accepted non-gesture presses retain their edge disposition even when
     /// moving the pointer changes the binding before physical release.
     static SUPPRESSED_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
-    /// Presses dropped as echoes of a HID++-diverted control. Their release
-    /// is dropped too, even if the capture session ends in between.
-    static ECHOED_PRESSES: RefCell<HashSet<ButtonId>> = RefCell::new(HashSet::new());
+    /// Presses judged against a HID++ diversion. Their release follows the
+    /// press, even if the capture session ends in between.
+    static DIVERTED_PRESSES: RefCell<HashMap<ButtonId, DivertedPress>> =
+        RefCell::new(HashMap::new());
     /// Function keys whose held action owns an accepted lifecycle. Repeated
     /// key-down events are auto-repeat, not replacement presses; their first
     /// matching key-up ends the lifecycle.
@@ -262,8 +306,10 @@ thread_local! {
 /// macOS fails closed because its hook is global: only a known Logitech,
 /// non-trackpad source may be suppressed. Bluetooth-direct Back/Forward
 /// gestures are captured through their device-specific HID++ session instead
-/// of weakening this policy. Linux/Windows restrict hook attachment upstream,
-/// so an unavailable source remains eligible there.
+/// of weakening this policy. Linux and Windows keep an unavailable source
+/// eligible. Windows never names one, so a press there reads the selected
+/// device's bindings whichever mouse sent it, unless
+/// [`DivertedPress::OtherDevice`] rules that device out.
 fn button_source_may_remap(device: Option<&EventDevice>) -> bool {
     match device {
         Some(d) => source_is_remappable(Some(d)),
@@ -382,25 +428,20 @@ fn handle_button(
     let (binding, chord, is_gesture, pointer, diverted) =
         hooks
             .try_read()
-            .map_or((None, None, false, None, false), |maps| {
+            .map_or((None, None, false, None, None), |maps| {
                 let (binding, is_gesture) = maps.press_binding(id);
                 (
                     binding,
                     maps.chord_member(id),
                     is_gesture,
                     maps.pointer_press(id),
-                    device.is_some_and(|source| maps.diverted_buttons.owns(source, id)),
+                    maps.diverted_press(id, device),
                 )
             });
-    let echoed = ECHOED_PRESSES.with_borrow_mut(|echoes| {
-        if pressed {
-            echoed_press(id, diverted, echoes)
-        } else {
-            echoes.remove(&id)
-        }
-    });
-    if echoed {
-        return EventDisposition::Suppress;
+    let diverted =
+        DIVERTED_PRESSES.with_borrow_mut(|judged| diverted_edge(id, pressed, diverted, judged));
+    if let Some(diverted) = diverted {
+        return diverted.disposition();
     }
     let action_target = if pressed {
         ActionDispatchTarget::for_pointer(pointer, capture_safari_pid)
@@ -469,20 +510,24 @@ fn binding_is_native_click(id: ButtonId, binding: &Binding) -> bool {
     !matches!(binding, Binding::LongPress(_)) && is_native_click(id, &binding.click_action())
 }
 
-/// Whether a press is the OS copy of a control a HID++ capture session has
-/// diverted on the same device, remembering the answer for its release.
-///
-/// The session dispatches that press, so the hook must not dispatch it again
-/// (#2158). It must not pass it through either: diversion already took the
-/// control out of the native report, so this copy reaching the desktop would
-/// be a second, unbound press.
-fn echoed_press(id: ButtonId, diverted: bool, echoes: &mut HashSet<ButtonId>) -> bool {
-    if diverted {
-        echoes.insert(id);
-    } else {
-        echoes.remove(&id);
+/// The diversion verdict for one edge of `id`. A press takes `verdict` and
+/// remembers it; a release takes whatever its press was given, so the two
+/// edges never split between the hook and the desktop.
+fn diverted_edge(
+    id: ButtonId,
+    pressed: bool,
+    verdict: Option<DivertedPress>,
+    judged: &mut HashMap<ButtonId, DivertedPress>,
+) -> Option<DivertedPress> {
+    if !pressed {
+        return judged.remove(&id);
     }
-    diverted
+    if let Some(verdict) = verdict {
+        judged.insert(id, verdict);
+    } else {
+        judged.remove(&id);
+    }
+    verdict
 }
 
 /// Press of a remapped single-action button: suppress when the action was

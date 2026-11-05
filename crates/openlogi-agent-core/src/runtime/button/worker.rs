@@ -104,6 +104,13 @@ fn process_command(
                 emit,
             );
         }
+        ButtonCommand::CancelGKeys(source) => {
+            emit_canceled(
+                state.cancel_g_keys(&source),
+                CancelReason::SourceEnded,
+                emit,
+            );
+        }
         ButtonCommand::CancelHooks => {
             emit_canceled(state.cancel_hooks(), CancelReason::SourceEnded, emit);
         }

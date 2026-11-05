@@ -51,8 +51,8 @@ pub use revision::ConfigRevision;
 pub use settings::LightSettings;
 pub use settings::{
     AppIcon, AppSettings, Appearance, AssetSourcePreference, CameraControls, CameraStreamMode,
-    ChordSettings, ChordWindow, ClickLock, ClickLockHold, DeviceViewMode, GlideShape, Lighting,
-    MomentumParams, MomentumScrolling, MouseProfileTarget, OnboardMemory,
+    ChordSettings, ChordWindow, ClickLock, ClickLockHold, DeviceViewMode, GKeyOwner, GamingKeyMode,
+    GlideShape, Lighting, MomentumParams, MomentumScrolling, MouseProfileTarget, OnboardMemory,
     SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution, SmartShift,
     ThumbwheelSensitivity, UiScale, VerticalScrollSensitivity, WheelMode, chords_supported,
     click_lock_supported,
