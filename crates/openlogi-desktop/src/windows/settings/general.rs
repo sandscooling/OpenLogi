@@ -3,14 +3,15 @@
 use super::{
     App, AppState, ChordWindow, ClickLockHold, Disableable, Entity, FluentBuilder, IconName,
     InteractiveElement, ParentElement, SettingField, SettingGroup, SettingItem, SettingPage,
-    SharedString, Sizable, Slider, SliderState, Styled, ThumbwheelSensitivity,
-    VerticalScrollSensitivity, div, theme,
+    SharedString, Slider, SliderState, Styled, ThumbwheelSensitivity, VerticalScrollSensitivity,
+    div, theme,
 };
 use crate::ui::commit_slider::SliderUnit;
 use crate::ui::slider_row::SliderRow;
 use crate::ui::theme::FocusRingStyle as _;
 use crate::ui::theme::Typography as _;
 use gpui_kit::base::Button as BaseButton;
+use gpui_kit::component::Sizable as _;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::switch::Switch;
 use openlogi_core::config::{MouseProfileTarget, chords_supported, click_lock_supported};
@@ -147,11 +148,13 @@ fn mouse_profile_target_item() -> SettingItem {
             RadioGroup::vertical("mouse-profile-target")
                 .child(
                     Radio::new("mouse-profile-pointer")
+                        .small()
                         .label(tr!("pointer.mouse_profile_pointer"))
                         .debug_selector(|| "mouse-profile-pointer".into()),
                 )
                 .child(
                     Radio::new("mouse-profile-focused")
+                        .small()
                         .label(tr!("pointer.mouse_profile_focused"))
                         .debug_selector(|| "mouse-profile-focused".into()),
                 )
@@ -247,6 +250,7 @@ fn click_lock_hold_item(
                 })
                 .description(description.clone())
                 .disabled(!can_run)
+                .compact()
         }
     })
     .keywords([title, description])
@@ -277,6 +281,7 @@ fn chord_window_item(row: ChordWindowRow) -> SettingItem {
                     row.marker(tr!("common.default"))
                 })
                 .description(description.clone())
+                .compact()
         }
     })
     .keywords([title, description])
@@ -346,7 +351,8 @@ fn lock_key_notifications_item() -> SettingItem {
 
 /// A sensitivity slider laid out as the device pages lay theirs out — label
 /// and value on one line, the slider across the row — with "Default" beside
-/// the value while it rests there. A custom item has no title of its own, so
+/// the value while it rests there, in the kit items' type step so it matches
+/// the switches above and below it. A custom item has no title of its own, so
 /// its title and description are its search keywords.
 fn sensitivity_item<T: SliderUnit + std::fmt::Display>(
     title: SharedString,
@@ -363,6 +369,7 @@ fn sensitivity_item<T: SliderUnit + std::fmt::Display>(
                 .value(value.to_string(), [max.to_string()])
                 .when(value == default, |row| row.marker(tr!("common.default")))
                 .description(description.clone())
+                .compact()
         }
     })
     .keywords([title, description])
