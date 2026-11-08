@@ -114,8 +114,8 @@ fn adding_a_chord_saves_it_once_an_action_is_picked(cx: &mut TestAppContext) {
     click_picker_control(cx, "inspector-chord-partner-Forward");
     assert!(chords(cx).is_empty(), "a partner alone saves nothing");
     assert_eq!(
-        view.read_with(cx, |view, _| view.picker),
-        InspectorPicker::ChordAction(chord("Back+Forward"))
+        view.read_with(cx, |view, _| view.mode.picker_target()),
+        Some(PickerTarget::ChordAction(chord("Back+Forward")))
     );
 
     click_picker_control(cx, "inspector-chord-action-Copy");
@@ -124,8 +124,8 @@ fn adding_a_chord_saves_it_once_an_action_is_picked(cx: &mut TestAppContext) {
         [(chord("Back+Forward"), Action::Copy, ChordStanding::Default)]
     );
     assert_eq!(
-        view.read_with(cx, |view, _| view.picker),
-        InspectorPicker::Closed
+        view.read_with(cx, |view, _| view.mode.picker_target()),
+        None
     );
     assert!(cx.debug_bounds("inspector-chord-row-Forward").is_some());
     close(view, cx);
@@ -214,8 +214,8 @@ fn a_chord_can_be_removed_from_the_lower_member(cx: &mut TestAppContext) {
     assert!(chords(cx).is_empty());
     assert!(cx.debug_bounds("inspector-chord-row-Forward").is_none());
     assert_eq!(
-        view.read_with(cx, |view, _| view.picker),
-        InspectorPicker::Closed,
+        view.read_with(cx, |view, _| view.mode.picker_target()),
+        None,
         "removing the chord being edited closes its picker"
     );
     close(view, cx);
@@ -600,8 +600,8 @@ fn the_button_picker_and_the_chord_pickers_replace_each_other(cx: &mut TestAppCo
     click_picker_control(cx, "inspector-add-chord");
     click_picker_control(cx, "inspector-current-action");
     assert_eq!(
-        view.read_with(cx, |view, _| view.picker),
-        InspectorPicker::Action
+        view.read_with(cx, |view, _| view.mode.picker_target()),
+        Some(PickerTarget::Action)
     );
     assert!(cx.debug_bounds("inspector-chord-partner-Forward").is_none());
     assert!(cx.debug_bounds("inspector-action-Copy").is_some());
@@ -611,8 +611,8 @@ fn the_button_picker_and_the_chord_pickers_replace_each_other(cx: &mut TestAppCo
     click_picker_control(cx, "inspector-chord-partner-Forward");
     select(&view, cx, ButtonId::Forward);
     assert_eq!(
-        view.read_with(cx, |view, _| view.picker),
-        InspectorPicker::Closed
+        view.read_with(cx, |view, _| view.mode.picker_target()),
+        None
     );
     close(view, cx);
 }
