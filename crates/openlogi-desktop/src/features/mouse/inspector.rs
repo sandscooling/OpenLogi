@@ -172,11 +172,11 @@ pub(super) fn binding_inspector(
     };
 
     v_flex()
-        .debug_selector(|| "button-inspector".into())
         .w(px(INSPECTOR_W))
         .h_full()
         .min_h_0()
         .flex_shrink_0()
+        .debug_selector(|| "binding-inspector".into())
         .border_l_1()
         .border_color(pal.border)
         .bg(pal.panel)

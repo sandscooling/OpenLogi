@@ -510,7 +510,7 @@ fn every_chord_row_fits_at_the_largest_scale(cx: &mut TestAppContext) {
     cx.update(|window, _| window.set_rem_size(crate::ui::theme::rem_size(UiScale::ExtraLarge)));
     open_app(cx, Some(&long_name));
 
-    let inspector = cx.debug_bounds("button-inspector").expect("inspector");
+    let inspector = cx.debug_bounds("binding-inspector").expect("inspector");
     for (selector, trailing) in [
         (
             "inspector-chord-row-Forward",
