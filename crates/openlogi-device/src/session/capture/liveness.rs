@@ -7,7 +7,12 @@ use tokio::sync::Notify;
 use tokio::time::Instant;
 
 /// A channel must be wholly idle for this long before capture probes it.
-pub(super) const IDLE_INTERVAL: Duration = Duration::from_secs(20);
+///
+/// Each probe is a ping the device answers over the air, so a short interval
+/// keeps an idle wireless device's radio busy all day. Only watched sessions
+/// (gesture capture, so the mouse) are probed; keyboard capture is unwatched. Two minutes still replaces a
+/// dead channel within a few minutes (two silent strikes).
+pub(super) const IDLE_INTERVAL: Duration = Duration::from_mins(2);
 
 /// Consecutive all-silent probes after which capture replaces the channel.
 const SILENT_STRIKES_BEFORE_RESTART: u8 = 2;

@@ -14,14 +14,19 @@ use crate::host_lock::ReceiverRegisterPhase;
 
 /// How long a device's probe is reused before a fresh read.
 /// The expensive part of a probe (the `enumerate_features` feature-table walk)
-/// reads *immutable* data — model, capabilities, marketing type — so it never
+/// reads *immutable* data (model, capabilities, marketing type), so it never
 /// needs re-reading for a known device; the periodic full probe is kept only as
 /// a self-healing pass (e.g. a firmware update reshuffling the feature table).
 /// The volatile battery does NOT ride this window: cache hits re-read it every
 /// reconciliation through the memoized feature index (see [`read_battery`]).
 /// Elapsed time rather than scan count preserves cache freshness now that
 /// event-driven scans are intentionally irregular.
-pub(super) const REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// An hour, not seconds: a cache hit keeps the original `probed_at`, so a
+/// short window re-walks the table (~60 requests) once per window for every
+/// device, all day. Over a Bolt or Bluetooth link each request wakes the
+/// device's radio, which noticeably shortened keyboard battery life.
+pub(super) const REFRESH_INTERVAL: Duration = Duration::from_hours(1);
 
 /// How long a due refresh may re-read a known device after the device answered
 /// its ping (see [`refresh_features`]).

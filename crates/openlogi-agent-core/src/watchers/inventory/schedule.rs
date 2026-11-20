@@ -30,11 +30,20 @@ const RECOVERY_WAKE_MARGIN: Duration = Duration::from_secs(1);
 /// Receiver notifications and OS hotplug can be disabled, unsupported, or
 /// missed across firmware/host transitions. Unified battery has an event, but
 /// legacy `0x1000` and voltage `0x1001` batteries do not. The period sits
-/// [`RECOVERY_WAKE_MARGIN`] inside the probe-cache window so a slightly late
-/// wake still reuses the feature table, keeps those readings on the same
-/// cadence, and does not return to constant full HID scans.
-pub(super) const RECOVERY_SCAN_PERIOD: Duration =
-    PROBE_CACHE_FRESHNESS.saturating_sub(RECOVERY_WAKE_MARGIN);
+/// well inside the probe-cache window (at least [`RECOVERY_WAKE_MARGIN`]) so
+/// a slightly late wake still reuses the feature table and does not return to
+/// constant full HID scans.
+///
+/// Minutes, not seconds: every scan re-reads each device's battery over the
+/// air, which wakes a wireless device's radio. Battery levels change slowly,
+/// and unified-battery devices push their own events in between.
+pub(super) const RECOVERY_SCAN_PERIOD: Duration = Duration::from_mins(5);
+
+const _: () = assert!(
+    RECOVERY_SCAN_PERIOD.as_secs() + RECOVERY_WAKE_MARGIN.as_secs()
+        <= PROBE_CACHE_FRESHNESS.as_secs(),
+    "a recovery scan must land inside the probe-cache window"
+);
 
 /// Wall-clock lead over monotonic time that means the monotonic clock paused
 /// during system sleep. NTP false positives only cause harmless re-apply.
@@ -487,13 +496,9 @@ mod tests {
         let (due, purpose) = schedule.next_deadline();
         assert_eq!(purpose, DeadlinePurpose::RecoveryScan);
         assert_eq!(due, started + RECOVERY_SCAN_PERIOD);
-        assert_eq!(
-            RECOVERY_SCAN_PERIOD + RECOVERY_WAKE_MARGIN,
-            PROBE_CACHE_FRESHNESS
-        );
+        assert!(RECOVERY_SCAN_PERIOD + RECOVERY_WAKE_MARGIN <= PROBE_CACHE_FRESHNESS);
         let on_time = due;
         let late_by_margin = due + RECOVERY_WAKE_MARGIN;
-        assert_eq!(late_by_margin, started + PROBE_CACHE_FRESHNESS);
         assert!(
             !openlogi_hid::inventory::probe_cache_is_stale(started, on_time),
             "an on-time recovery wake must hit the probe cache"
@@ -505,7 +510,7 @@ mod tests {
         assert!(
             openlogi_hid::inventory::probe_cache_is_stale(
                 started,
-                late_by_margin + Duration::from_nanos(1),
+                started + PROBE_CACHE_FRESHNESS + Duration::from_nanos(1),
             ),
             "the cache is stale only after the freshness window"
         );
